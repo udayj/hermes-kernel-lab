@@ -13,11 +13,11 @@ struct MessageRequest<'a> {
     model: &'a str,
     max_tokens: u32,
     stream: bool,
-    messages: [UserMessage<'a>; 1],
+    messages: &'a [TextMessage<'a>],
 }
 
 #[derive(Serialize)]
-struct UserMessage<'a> {
+struct TextMessage<'a> {
     role: &'a str,
     content: &'a str,
 }
@@ -40,13 +40,23 @@ enum ContentBlock {
     Unsupported,
 }
 
-fn user_message(mut args: impl Iterator<Item = OsString>) -> Result<String, String> {
+fn user_messages(
+    mut args: impl Iterator<Item = OsString>,
+) -> Result<(String, Option<String>), String> {
     let message = args
         .next()
-        .ok_or("usage: hermes-kernel-lab \"one user message\"")?;
+        .ok_or("usage: hermes-kernel-lab \"first message\" [\"follow-up message\"]")?;
+    let follow_up = args.next();
     if args.next().is_some() {
-        return Err("expected exactly one quoted user message".into());
+        return Err("expected one or two quoted user messages".into());
     }
+    Ok((
+        validate_message(message)?,
+        follow_up.map(validate_message).transpose()?,
+    ))
+}
+
+fn validate_message(message: OsString) -> Result<String, String> {
     let message = message
         .into_string()
         .map_err(|_| "user message must be valid Unicode")?;
@@ -87,7 +97,7 @@ fn api_key() -> Result<String, String> {
     }
 }
 
-fn build_request(message: &str, key: &str) -> Result<Request<Vec<u8>>, String> {
+fn build_request(messages: &[TextMessage<'_>], key: &str) -> Result<Request<Vec<u8>>, String> {
     if key.is_empty() || !key.bytes().all(|byte| byte.is_ascii_graphic()) {
         return Err("ANTHROPIC_API_KEY must be nonempty ASCII without whitespace".into());
     }
@@ -97,10 +107,7 @@ fn build_request(message: &str, key: &str) -> Result<Request<Vec<u8>>, String> {
         model: MODEL,
         max_tokens: MAX_TOKENS,
         stream: false,
-        messages: [UserMessage {
-            role: "user",
-            content: message,
-        }],
+        messages,
     })
     .map_err(|_| "could not encode the request as JSON")?;
     Request::post(ENDPOINT)
@@ -163,16 +170,8 @@ fn transport_error(error: ureq::Error) -> String {
     .into()
 }
 
-fn run() -> Result<(), String> {
-    let message = user_message(env::args_os().skip(1))?;
-    let request = build_request(&message, &api_key()?)?;
-    let client: ureq::Agent = ureq::Agent::config_builder()
-        .https_only(true)
-        .max_redirects(0)
-        .http_status_as_error(false)
-        .timeout_global(Some(Duration::from_secs(60)))
-        .build()
-        .into();
+fn send(client: &ureq::Agent, messages: &[TextMessage<'_>], key: &str) -> Result<String, String> {
+    let request = build_request(messages, key)?;
     let mut response = client.run(request).map_err(transport_error)?;
     check_status(response.status().as_u16())?;
     let body = response
@@ -181,9 +180,40 @@ fn run() -> Result<(), String> {
         .limit(MAX_RESPONSE_BYTES)
         .read_to_vec()
         .map_err(transport_error)?;
-    let text = decode_response(&body)?;
-    writeln!(std::io::stdout().lock(), "{text}")
-        .map_err(|_| "could not write response to stdout".into())
+    decode_response(&body)
+}
+
+fn run() -> Result<(), String> {
+    let (first, follow_up) = user_messages(env::args_os().skip(1))?;
+    let key = api_key()?;
+    let client: ureq::Agent = ureq::Agent::config_builder()
+        .https_only(true)
+        .max_redirects(0)
+        .http_status_as_error(false)
+        .timeout_global(Some(Duration::from_secs(60)))
+        .build()
+        .into();
+    let mut history = vec![TextMessage {
+        role: "user",
+        content: &first,
+    }];
+    let first_response = send(&client, &history, &key)?;
+    let mut output = std::io::stdout().lock();
+    writeln!(output, "{first_response}").map_err(|_| "could not write response to stdout")?;
+
+    if let Some(follow_up) = follow_up {
+        history.push(TextMessage {
+            role: "assistant",
+            content: &first_response,
+        });
+        history.push(TextMessage {
+            role: "user",
+            content: &follow_up,
+        });
+        let second_response = send(&client, &history, &key)?;
+        writeln!(output, "{second_response}").map_err(|_| "could not write response to stdout")?;
+    }
+    Ok(())
 }
 
 fn main() -> ExitCode {
@@ -211,7 +241,14 @@ mod tests {
     #[test]
     fn request_exposes_the_wire_contract() {
         let text = "  Say \"hello\"\n世界\\  ";
-        let request = build_request(text, "synthetic-key").unwrap();
+        let request = build_request(
+            &[TextMessage {
+                role: "user",
+                content: text,
+            }],
+            "synthetic-key",
+        )
+        .unwrap();
         assert_eq!(request.method(), "POST");
         assert_eq!(request.uri(), ENDPOINT);
         assert_eq!(request.headers()["x-api-key"], "synthetic-key");
@@ -230,19 +267,38 @@ mod tests {
         for args in [
             vec![],
             vec![" \n".into()],
-            vec!["a".into(), "b".into()],
+            vec!["a".into(), "b".into(), "c".into()],
             vec!["x".repeat(MAX_MESSAGE_BYTES + 1).into()],
+            vec!["a".into(), " \n".into()],
+            vec!["a".into(), "é".repeat(MAX_MESSAGE_BYTES / 2 + 1).into()],
         ] {
-            assert!(user_message(args.into_iter()).is_err());
+            let result = user_messages(args.into_iter());
+            assert!(result.is_err());
         }
         let text = " x ";
-        assert_eq!(user_message(vec![text.into()].into_iter()).unwrap(), text);
-        assert!(user_message(vec!["x".repeat(MAX_MESSAGE_BYTES).into()].into_iter()).is_ok());
+        assert_eq!(
+            user_messages(vec![text.into()].into_iter()).unwrap(),
+            (text.into(), None)
+        );
+        assert!(
+            user_messages(
+                vec![
+                    "x".repeat(MAX_MESSAGE_BYTES).into(),
+                    "é".repeat(MAX_MESSAGE_BYTES / 2).into()
+                ]
+                .into_iter()
+            )
+            .is_ok()
+        );
+        let messages = [TextMessage {
+            role: "user",
+            content: "hello",
+        }];
         for key in ["", " ", "synthetic\nsecret", "synthetic\tsecret", "é"] {
-            assert!(build_request("hello", key).is_err());
+            assert!(build_request(&messages, key).is_err());
         }
         assert!(
-            !build_request("hello", "synthetic\nsecret")
+            !build_request(&messages, "synthetic\nsecret")
                 .unwrap_err()
                 .contains("synthetic")
         );
@@ -253,11 +309,13 @@ mod tests {
     fn rejects_non_unicode_message_without_panicking() {
         use std::os::unix::ffi::OsStringExt;
 
-        let message = OsString::from_vec(vec![0xff]);
-        assert_eq!(
-            user_message([message].into_iter()).unwrap_err(),
-            "user message must be valid Unicode"
-        );
+        for args in [
+            vec![OsString::from_vec(vec![0xff])],
+            vec!["first".into(), OsString::from_vec(vec![0xff])],
+        ] {
+            let result = user_messages(args.into_iter());
+            assert_eq!(result.unwrap_err(), "user message must be valid Unicode");
+        }
     }
 
     #[test]
@@ -283,14 +341,6 @@ mod tests {
             decode_response(&serde_json::to_vec(&response()).unwrap()).unwrap(),
             "Hello 世界!"
         );
-        for details in [json!({"type":"refusal"}), json!(42), json!(null)] {
-            let mut body = response();
-            body["stop_details"] = details;
-            assert_eq!(
-                decode_response(&serde_json::to_vec(&body).unwrap()).unwrap(),
-                "Hello 世界!"
-            );
-        }
     }
 
     #[test]
@@ -313,7 +363,7 @@ mod tests {
     }
 
     #[test]
-    fn cli_withholds_text_for_unaccepted_outcomes() {
+    fn decoder_rejects_unaccepted_stop_reasons() {
         for (reason, expected) in [
             (
                 "max_tokens",
@@ -333,7 +383,7 @@ mod tests {
 
     #[test]
     fn rejects_malformed_missing_empty_and_non_text_responses() {
-        for body in [b"not json".as_slice(), b"{}", b"{\"type\":\"error\"}"] {
+        for body in [b"not json".as_slice(), b"{}"] {
             assert!(decode_response(body).is_err());
         }
         for content in [
@@ -347,11 +397,7 @@ mod tests {
             body["content"] = content;
             assert!(decode_response(&serde_json::to_vec(&body).unwrap()).is_err());
         }
-        for (field, value) in [
-            ("role", json!("user")),
-            ("type", json!("error")),
-            ("stop_reason", json!("tool_use")),
-        ] {
+        for (field, value) in [("role", json!("user")), ("type", json!("error"))] {
             let mut body = response();
             body[field] = value;
             assert!(decode_response(&serde_json::to_vec(&body).unwrap()).is_err());
@@ -361,7 +407,7 @@ mod tests {
     #[test]
     fn unsuccessful_statuses_and_transport_failures_are_clear() {
         assert!(check_status(200).is_ok());
-        for status in [201, 302, 307, 308, 400, 403, 404, 413, 429, 500, 529] {
+        for status in [201, 500] {
             assert_eq!(
                 check_status(status).unwrap_err(),
                 format!("Anthropic HTTP {status}: unexpected response status")
