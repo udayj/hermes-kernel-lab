@@ -5,6 +5,7 @@ use ureq::http::{HeaderValue, Request};
 const ENDPOINT: &str = "https://api.anthropic.com/v1/messages";
 const MODEL: &str = "claude-haiku-4-5-20251001";
 const MAX_TOKENS: u32 = 512;
+const MAX_MODEL_CALLS_PER_TURN: usize = 8;
 const MAX_MESSAGE_BYTES: usize = 16 * 1024;
 const MAX_RESPONSE_BYTES: u64 = 1024 * 1024;
 
@@ -13,15 +14,24 @@ struct MessageRequest<'a> {
     model: &'a str,
     max_tokens: u32,
     stream: bool,
-    messages: &'a [TextMessage<'a>],
+    messages: &'a [Message],
     tools: serde_json::Value,
     tool_choice: serde_json::Value,
 }
 
 #[derive(Serialize)]
-struct TextMessage<'a> {
-    role: &'a str,
-    content: &'a str,
+struct Message {
+    role: &'static str,
+    content: Vec<ContentBlock>,
+}
+
+impl Message {
+    fn user(text: String) -> Self {
+        Self {
+            role: "user",
+            content: vec![ContentBlock::Text { text }],
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -33,7 +43,7 @@ struct MessageResponse {
     stop_reason: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(tag = "type")]
 enum ContentBlock {
     #[serde(rename = "text")]
@@ -42,22 +52,57 @@ enum ContentBlock {
     ToolUse {
         id: String,
         name: String,
-        input: EchoInput,
+        input: serde_json::Value,
+    },
+    #[serde(rename = "tool_result", skip_deserializing)]
+    ToolResult {
+        tool_use_id: String,
+        content: String,
     },
     #[serde(other)]
     Unsupported,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-struct EchoInput {
-    text: String,
+#[derive(Debug)]
+struct Response {
+    content: Vec<ContentBlock>,
+    tool_call_id: Option<String>,
 }
 
-#[derive(Debug)]
-enum Response {
-    Text(String),
-    ToolRequested(Vec<ContentBlock>),
+#[derive(Serialize)]
+struct RuntimeInfo {
+    target_os: &'static str,
+    target_arch: &'static str,
+    available_parallelism: Option<usize>,
+}
+
+fn get_runtime_info() -> RuntimeInfo {
+    RuntimeInfo {
+        target_os: env::consts::OS,
+        target_arch: env::consts::ARCH,
+        available_parallelism: std::thread::available_parallelism().map(|n| n.get()).ok(),
+    }
+}
+
+fn tool_result(id: String, result: &RuntimeInfo) -> Result<Message, String> {
+    let content =
+        serde_json::to_string(result).map_err(|_| "could not encode runtime information")?;
+    Ok(Message {
+        role: "user",
+        content: vec![ContentBlock::ToolResult {
+            tool_use_id: id,
+            content,
+        }],
+    })
+}
+
+fn check_call_budget(response: &Response, calls: usize) -> Result<(), String> {
+    if response.tool_call_id.is_some() && calls >= MAX_MODEL_CALLS_PER_TURN {
+        return Err(
+            "model-call budget exhausted (8 calls per user turn); tool not executed".into(),
+        );
+    }
+    Ok(())
 }
 
 fn user_messages(
@@ -117,7 +162,7 @@ fn api_key() -> Result<String, String> {
     }
 }
 
-fn build_request(messages: &[TextMessage<'_>], key: &str) -> Result<Request<Vec<u8>>, String> {
+fn build_request(messages: &[Message], key: &str) -> Result<Request<Vec<u8>>, String> {
     if key.is_empty() || !key.bytes().all(|byte| byte.is_ascii_graphic()) {
         return Err("ANTHROPIC_API_KEY must be nonempty ASCII without whitespace".into());
     }
@@ -129,12 +174,12 @@ fn build_request(messages: &[TextMessage<'_>], key: &str) -> Result<Request<Vec<
         stream: false,
         messages,
         tools: serde_json::json!([{
-            "name": "echo",
-            "description": "Repeat the supplied text.",
+            "name": "get_runtime_info",
+            "description": "Return the binary target OS and architecture, and an estimate of parallelism available to this process, not a physical-core count or current CPU load.",
             "input_schema": {
                 "type": "object",
-                "properties": {"text": {"type": "string"}},
-                "required": ["text"],
+                "properties": {},
+                "required": [],
                 "additionalProperties": false
             }
         }]),
@@ -178,10 +223,11 @@ fn decode_response(body: &[u8]) -> Result<Response, String> {
     }
     let mut text = String::new();
     let mut tool_count = 0;
+    let mut tool_call_id = None;
     for block in &response.content {
         match block {
             ContentBlock::Text { text: part } => text.push_str(part),
-            ContentBlock::ToolUse { id, name, .. } => {
+            ContentBlock::ToolUse { id, name, input } => {
                 if id.is_empty()
                     || !id
                         .bytes()
@@ -189,15 +235,19 @@ fn decode_response(body: &[u8]) -> Result<Response, String> {
                 {
                     return Err("tool request has an invalid call ID".into());
                 }
-                if name != "echo" {
+                if name != "get_runtime_info" {
                     return Err("tool request names an unadvertised tool".into());
                 }
+                if !input.as_object().is_some_and(|object| object.is_empty()) {
+                    return Err("get_runtime_info input must be exactly an empty object".into());
+                }
+                tool_call_id = Some(id.clone());
                 tool_count += 1;
                 if tool_count > 1 {
                     return Err("response contains multiple tool requests".into());
                 }
             }
-            ContentBlock::Unsupported => {
+            ContentBlock::Unsupported | ContentBlock::ToolResult { .. } => {
                 return Err("response contains unsupported non-text content".into());
             }
         }
@@ -205,13 +255,13 @@ fn decode_response(body: &[u8]) -> Result<Response, String> {
     if (response.stop_reason == "tool_use") != (tool_count == 1) {
         return Err("response stop_reason is inconsistent with tool request content".into());
     }
-    if tool_count == 1 {
-        return Ok(Response::ToolRequested(response.content));
-    }
-    if text.trim().is_empty() {
+    if tool_count == 0 && text.trim().is_empty() {
         return Err("response contains no usable text".into());
     }
-    Ok(Response::Text(text))
+    Ok(Response {
+        content: response.content,
+        tool_call_id,
+    })
 }
 
 fn transport_error(error: ureq::Error) -> String {
@@ -224,7 +274,7 @@ fn transport_error(error: ureq::Error) -> String {
     .into()
 }
 
-fn send(client: &ureq::Agent, messages: &[TextMessage<'_>], key: &str) -> Result<Response, String> {
+fn send(client: &ureq::Agent, messages: &[Message], key: &str) -> Result<Response, String> {
     let request = build_request(messages, key)?;
     let mut response = client.run(request).map_err(transport_error)?;
     check_status(response.status().as_u16())?;
@@ -237,42 +287,79 @@ fn send(client: &ureq::Agent, messages: &[TextMessage<'_>], key: &str) -> Result
     decode_response(&body)
 }
 
-fn write_response(
-    output: &mut impl Write,
-    response: &Response,
-    follow_up_pending: bool,
-) -> Result<(), String> {
+fn write_response(output: &mut impl Write, response: &Response) -> Result<(), String> {
     let mut write = || -> std::io::Result<()> {
-        match response {
-            Response::Text(text) => writeln!(output, "{text}"),
-            Response::ToolRequested(blocks) => {
-                writeln!(output, "Tool requested, not executed (task incomplete):")?;
-                for block in blocks {
-                    match block {
-                        ContentBlock::Text { text } => write!(output, "{text}")?,
-                        ContentBlock::ToolUse { id, name, input } => {
-                            writeln!(output, "\nCall ID: {id}\nName: {name}")?;
-                            write!(output, "Arguments: ")?;
-                            serde_json::to_writer(&mut *output, input)?;
-                            writeln!(output)?;
-                        }
-                        ContentBlock::Unsupported => unreachable!("decoder validates content"),
-                    }
-                }
-                writeln!(output)?;
-                if follow_up_pending {
-                    writeln!(output, "Supplied follow-up was not sent.")?;
-                }
-                Ok(())
+        let mut has_text = false;
+        for block in &response.content {
+            if let ContentBlock::Text { text } = block {
+                write!(output, "{text}")?;
+                has_text = true;
             }
         }
+        if has_text {
+            writeln!(output)?;
+        }
+        output.flush()
     };
     write().map_err(|_| "could not write response to stdout".into())
 }
 
+fn write_tool_result(output: &mut impl Write, result: &Message) -> Result<(), String> {
+    let ContentBlock::ToolResult {
+        tool_use_id,
+        content,
+    } = &result.content[0]
+    else {
+        unreachable!("tool_result constructs a result block")
+    };
+    writeln!(
+        output,
+        "[Local get_runtime_info result; call {tool_use_id}] {content}"
+    )
+    .and_then(|()| output.flush())
+    .map_err(|_| "could not write local tool result to stdout".into())
+}
+
+fn run_turn(
+    client: &ureq::Agent,
+    key: &str,
+    history: &mut Vec<Message>,
+    message: String,
+    output: &mut impl Write,
+) -> Result<(), String> {
+    history.push(Message::user(message));
+    for calls in 1..=MAX_MODEL_CALLS_PER_TURN {
+        let response = send(client, history, key)?;
+        // The whole response and remaining budget are checked before any effects.
+        check_call_budget(&response, calls)?;
+        write_response(output, &response)?;
+        history.push(Message {
+            role: "assistant",
+            content: response.content,
+        });
+        match response.tool_call_id {
+            Some(id) => {
+                let result = tool_result(id, &get_runtime_info())?;
+                history.push(result);
+                write_tool_result(output, history.last().expect("just appended result"))?;
+            }
+            None => return Ok(()),
+        }
+    }
+    unreachable!("call eight either ends the turn or fails before tool execution")
+}
+
+fn with_pending_follow_up(error: String, pending: bool) -> String {
+    if pending {
+        format!("{error}; supplied follow-up was not sent")
+    } else {
+        error
+    }
+}
+
 fn run() -> Result<(), String> {
     let (first, follow_up) = user_messages(env::args_os().skip(1))?;
-    let key = api_key()?;
+    let key = api_key().map_err(|error| with_pending_follow_up(error, follow_up.is_some()))?;
     let client: ureq::Agent = ureq::Agent::config_builder()
         .https_only(true)
         .max_redirects(0)
@@ -280,28 +367,12 @@ fn run() -> Result<(), String> {
         .timeout_global(Some(Duration::from_secs(60)))
         .build()
         .into();
-    let mut history = vec![TextMessage {
-        role: "user",
-        content: &first,
-    }];
-    let first_response = send(&client, &history, &key)?;
+    let mut history = Vec::new();
     let mut output = std::io::stdout().lock();
-    write_response(&mut output, &first_response, follow_up.is_some())?;
-    let Response::Text(first_response) = first_response else {
-        return Ok(());
-    };
-
+    run_turn(&client, &key, &mut history, first, &mut output)
+        .map_err(|error| with_pending_follow_up(error, follow_up.is_some()))?;
     if let Some(follow_up) = follow_up {
-        history.push(TextMessage {
-            role: "assistant",
-            content: &first_response,
-        });
-        history.push(TextMessage {
-            role: "user",
-            content: &follow_up,
-        });
-        let second_response = send(&client, &history, &key)?;
-        write_response(&mut output, &second_response, false)?;
+        run_turn(&client, &key, &mut history, follow_up, &mut output)?;
     }
     Ok(())
 }
@@ -331,14 +402,7 @@ mod tests {
     #[test]
     fn request_exposes_the_wire_contract() {
         let text = "  Say \"hello\"\n世界\\  ";
-        let request = build_request(
-            &[TextMessage {
-                role: "user",
-                content: text,
-            }],
-            "synthetic-key",
-        )
-        .unwrap();
+        let request = build_request(&[Message::user(text.into())], "synthetic-key").unwrap();
         assert_eq!(request.method(), "POST");
         assert_eq!(request.uri(), ENDPOINT);
         assert_eq!(request.headers()["x-api-key"], "synthetic-key");
@@ -348,10 +412,10 @@ mod tests {
         assert_eq!(
             serde_json::from_slice::<serde_json::Value>(request.body()).unwrap(),
             json!({"model":"claude-haiku-4-5-20251001", "max_tokens":512,
-                "stream":false,"messages":[{"role":"user","content":text}],
-                "tools":[{"name":"echo","description":"Repeat the supplied text.",
-                    "input_schema":{"type":"object","properties":{"text":{"type":"string"}},
-                        "required":["text"],"additionalProperties":false}}],
+                "stream":false,"messages":[{"role":"user","content":[{"type":"text","text":text}]}],
+                "tools":[{"name":"get_runtime_info","description":"Return the binary target OS and architecture, and an estimate of parallelism available to this process, not a physical-core count or current CPU load.",
+                    "input_schema":{"type":"object","properties":{},
+                        "required":[],"additionalProperties":false}}],
                 "tool_choice":{"type":"auto","disable_parallel_tool_use":true}})
         );
     }
@@ -384,10 +448,7 @@ mod tests {
             )
             .is_ok()
         );
-        let messages = [TextMessage {
-            role: "user",
-            content: "hello",
-        }];
+        let messages = [Message::user("hello".into())];
         for key in ["", " ", "synthetic\nsecret", "synthetic\tsecret", "é"] {
             assert!(build_request(&messages, key).is_err());
         }
@@ -432,10 +493,11 @@ mod tests {
     #[test]
     fn decodes_text_blocks_in_order_and_ignores_metadata() {
         let decoded = decode_response(&serde_json::to_vec(&response()).unwrap()).unwrap();
-        let Response::Text(text) = decoded else {
-            panic!("expected text")
-        };
-        assert_eq!(text, "Hello 世界!");
+        assert!(decoded.tool_call_id.is_none());
+        assert_eq!(
+            serde_json::to_value(decoded.content).unwrap(),
+            response()["content"]
+        );
     }
 
     #[test]
@@ -504,35 +566,83 @@ mod tests {
 
     fn tool_response() -> serde_json::Value {
         json!({"type":"message", "role":"assistant", "stop_reason":"tool_use",
-            "content":[{"type":"tool_use", "id":"toolu_synthetic", "name":"echo",
-                "input":{"text":"hello"}}]})
+            "content":[{"type":"tool_use", "id":"toolu_synthetic", "name":"get_runtime_info",
+                "input":{}}]})
     }
 
     #[test]
-    fn inspects_tool_only_and_mixed_content_in_order() {
-        for mixed in [false, true] {
-            let mut body = tool_response();
-            if mixed {
-                let blocks = body["content"].as_array_mut().unwrap();
-                blocks.insert(0, json!({"type":"text","text":"Before"}));
-                blocks.push(json!({"type":"text","text":"After"}));
-            }
+    fn tool_round_preserves_blocks_and_serializes_results() {
+        let mut body = tool_response();
+        body["content"]
+            .as_array_mut()
+            .unwrap()
+            .insert(0, json!({"type":"text","text":"Before"}));
+        body["content"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"type":"text","text":"After"}));
+        for parallelism in [Some(3), None] {
             let decoded = decode_response(&serde_json::to_vec(&body).unwrap()).unwrap();
-            assert!(matches!(decoded, Response::ToolRequested(_)));
-            for pending in [false, true] {
-                let mut output = Vec::new();
-                write_response(&mut output, &decoded, pending).unwrap();
-                let output = String::from_utf8(output).unwrap();
-                assert!(output.contains("requested, not executed (task incomplete)"));
-                assert!(output.contains("Call ID: toolu_synthetic\nName: echo"));
-                assert!(output.contains(r#"Arguments: {"text":"hello"}"#));
-                assert_eq!(output.contains("Supplied follow-up was not sent."), pending);
-                if mixed {
-                    assert!(output.find("Before").unwrap() < output.find("Call ID:").unwrap());
-                    assert!(output.find("Arguments:").unwrap() < output.find("After").unwrap());
-                }
-            }
+            let mut output = Vec::new();
+            write_response(&mut output, &decoded).unwrap();
+            let result = tool_result(
+                decoded.tool_call_id.unwrap(),
+                &RuntimeInfo {
+                    target_os: "synthetic-os",
+                    target_arch: "synthetic-arch",
+                    available_parallelism: parallelism,
+                },
+            )
+            .unwrap();
+            write_tool_result(&mut output, &result).unwrap();
+            let history = vec![
+                Message::user("Inspect".into()),
+                Message {
+                    role: "assistant",
+                    content: decoded.content,
+                },
+                result,
+            ];
+            let request = build_request(&history, "synthetic-key").unwrap();
+            let wire: serde_json::Value = serde_json::from_slice(request.body()).unwrap();
+            assert_eq!(
+                wire["messages"][1],
+                json!({"role":"assistant","content":body["content"]})
+            );
+            let content = wire["messages"][2]["content"][0]["content"]
+                .as_str()
+                .unwrap();
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(content).unwrap(),
+                json!({"target_os":"synthetic-os","target_arch":"synthetic-arch","available_parallelism":parallelism})
+            );
+            assert_eq!(
+                wire["messages"][2],
+                json!({"role":"user","content":[{
+                "type":"tool_result","tool_use_id":"toolu_synthetic","content":content}]})
+            );
+            assert_eq!(
+                String::from_utf8(output).unwrap(),
+                format!(
+                    "BeforeAfter\n[Local get_runtime_info result; call toolu_synthetic] {content}\n"
+                )
+            );
+            assert!(write_tool_result(&mut &mut [0u8; 0][..], &history[2]).is_err());
         }
+    }
+
+    #[test]
+    fn call_budget_allows_final_answer_but_requires_room_for_tool_result() {
+        for (body, is_tool) in [(response(), false), (tool_response(), true)] {
+            let decoded = decode_response(&serde_json::to_vec(&body).unwrap()).unwrap();
+            assert!(check_call_budget(&decoded, 7).is_ok());
+            assert_eq!(check_call_budget(&decoded, 8).is_err(), is_tool);
+        }
+        assert_eq!(
+            with_pending_follow_up("failed".into(), true),
+            "failed; supplied follow-up was not sent"
+        );
+        assert_eq!(with_pending_follow_up("failed".into(), false), "failed");
     }
 
     #[test]
@@ -548,7 +658,9 @@ mod tests {
             ("name", json!("other")),
             ("input", json!(null)),
             ("input", json!([])),
-            ("input", json!({})),
+            ("input", json!("")),
+            ("input", json!(42)),
+            ("input", json!({"extra":true})),
             ("input", json!({"text":null})),
             ("input", json!({"text":42})),
             ("input", json!({"text":"hello","extra":true})),
@@ -569,14 +681,13 @@ mod tests {
             json!([valid, valid]),
             json!([valid, {"type":"unknown"}]),
             json!([valid, {"type":"text"}]),
+            json!([valid, {"type":"tool_result","tool_use_id":"toolu_synthetic","content":"{}"}]),
         ] {
             let mut body = tool_response();
             body["content"] = content;
             assert!(decode_response(&serde_json::to_vec(&body).unwrap()).is_err());
         }
-        // Empty text is still a valid string argument for echo.
-        let mut body = tool_response();
-        body["content"][0]["input"]["text"] = json!("");
+        let body = tool_response();
         assert!(decode_response(&serde_json::to_vec(&body).unwrap()).is_ok());
     }
 
@@ -600,14 +711,19 @@ mod tests {
 
     #[test]
     fn text_output_is_unchanged_and_output_failures_are_reported() {
-        let decoded = Response::Text("Hello 世界!".into());
+        let decoded = decode_response(&serde_json::to_vec(&response()).unwrap()).unwrap();
         let mut output = Vec::new();
-        write_response(&mut output, &decoded, true).unwrap();
+        write_response(&mut output, &decoded).unwrap();
         assert_eq!(String::from_utf8(output).unwrap(), "Hello 世界!\n");
-        let tool = decode_response(&serde_json::to_vec(&tool_response()).unwrap()).unwrap();
+        let mut body = tool_response();
+        body["content"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"type":"text","text":"Checking"}));
+        let tool = decode_response(&serde_json::to_vec(&body).unwrap()).unwrap();
         for response in [decoded, tool] {
             assert_eq!(
-                write_response(&mut &mut [0u8; 0][..], &response, true).unwrap_err(),
+                write_response(&mut &mut [0u8; 0][..], &response).unwrap_err(),
                 "could not write response to stdout"
             );
         }
