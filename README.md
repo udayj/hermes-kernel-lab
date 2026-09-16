@@ -118,9 +118,18 @@ cargo test --offline
 cargo clippy --offline --all-targets -- -D warnings
 ```
 
-Tests use synthetic data and temporary workspaces and make no model API calls.
-They exercise input parsing, request and response validation, tool catalog and
-dispatch behavior, actual local filesystem operations and bounds, tool-result
-correlation, output failures, and model-call limits. Filesystem-specific checks
-run on the current Unix development host. HTTP-driven multi-turn behavior and
-other operating systems are not exercised end to end.
+Tests use synthetic data and temporary workspaces and make no model API calls
+or require credentials. They exercise input parsing, request and response
+validation, tool catalog and dispatch behavior, and actual local filesystem
+operations and bounds.
+
+Scripted model responses exercise the same agent loop used by the CLI, with real
+tool dispatch. These orchestration tests capture and assert the complete history
+and tool definitions supplied on each model call. They cover direct answers,
+correlated tool results, history inherited by a second user turn, recovery from
+tool errors, the eight-call boundary and budget reset, and model-call and output
+failures. Run just these tests with `cargo test agent::tests::scripted_`.
+The synthetic responses bypass HTTP and response decoding; they do not verify
+the integration between those layers and the loop. Filesystem-specific checks
+run on the current Unix development host. Live-provider behavior, HTTP-driven
+multi-turn behavior, and other operating systems are not exercised end to end.
