@@ -53,6 +53,19 @@ impl ToolCatalog {
         Self { workspace: None }
     }
 
+    pub(crate) fn read_instructions(&self, path: &Path) -> Result<String, String> {
+        let workspace = self
+            .workspace
+            .as_ref()
+            .ok_or("--instructions requires --workspace")?;
+        let path = path
+            .to_str()
+            .ok_or("instruction path must be valid Unicode")?;
+        workspace
+            .read(path)
+            .map_err(|error| format!("could not load instructions: {error}"))
+    }
+
     pub(crate) fn definitions(&self) -> Vec<ToolDefinition> {
         let mut definitions = vec![runtime_definition()];
         if self.workspace.is_some() {

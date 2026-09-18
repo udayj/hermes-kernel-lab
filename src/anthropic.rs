@@ -14,6 +14,7 @@ struct MessageRequest<'a> {
     model: &'a str,
     max_tokens: u32,
     stream: bool,
+    system: &'a str,
     messages: &'a [Message],
     tools: &'a [ToolDefinition],
     tool_choice: ToolChoice,
@@ -127,10 +128,11 @@ impl Client {
 
     pub(crate) fn send(
         &self,
+        system: &str,
         messages: &[Message],
         tools: &[ToolDefinition],
     ) -> Result<AssistantResponse, String> {
-        let request = build_request(messages, tools, &self.key)?;
+        let request = build_request(system, messages, tools, &self.key)?;
         let mut response = self.agent.run(request).map_err(transport_error)?;
         check_status(response.status().as_u16())?;
         let body = response
@@ -151,6 +153,7 @@ fn validate_key(key: &str) -> Result<(), String> {
 }
 
 fn build_request(
+    system: &str,
     messages: &[Message],
     tools: &[ToolDefinition],
     key: &str,
@@ -158,7 +161,7 @@ fn build_request(
     validate_key(key)?;
     let mut header = HeaderValue::from_str(key).map_err(|_| "invalid API key header")?;
     header.set_sensitive(true);
-    let body = encode_request(messages, tools)?;
+    let body = encode_request(system, messages, tools)?;
     Request::post(ENDPOINT)
         .header("x-api-key", header)
         .header("anthropic-version", "2023-06-01")
@@ -167,11 +170,16 @@ fn build_request(
         .map_err(|_| "could not construct the HTTP request".into())
 }
 
-fn encode_request(messages: &[Message], tools: &[ToolDefinition]) -> Result<Vec<u8>, String> {
+fn encode_request(
+    system: &str,
+    messages: &[Message],
+    tools: &[ToolDefinition],
+) -> Result<Vec<u8>, String> {
     let body = serde_json::to_vec(&MessageRequest {
         model: MODEL,
         max_tokens: MAX_TOKENS,
         stream: false,
+        system,
         messages,
         tools,
         tool_choice: ToolChoice {
@@ -296,13 +304,22 @@ mod tests {
     fn request_exposes_the_wire_contract() {
         let text = "  Say \"hello\"\n世界\\  ";
         let tools = ToolCatalog::without_workspace().definitions();
-        let request =
-            build_request(&[Message::user(text.into())], &tools, "synthetic-key").unwrap();
+        let request = build_request(
+            "synthetic system",
+            &[Message::user(text.into())],
+            &tools,
+            "synthetic-key",
+        )
+        .unwrap();
         assert_eq!(request.method(), "POST");
         assert_eq!(request.uri(), ENDPOINT);
         assert!(request.headers()["x-api-key"].is_sensitive());
         let wire: serde_json::Value = serde_json::from_slice(request.body()).unwrap();
-        assert_eq!(wire["messages"][0]["content"][0]["text"], text);
+        assert_eq!(wire["system"], "synthetic system");
+        assert_eq!(
+            wire["messages"],
+            json!([{"role":"user", "content":[{"type":"text", "text":text}]}])
+        );
         assert_eq!(wire["tools"][0]["name"], "get_runtime_info");
         assert_eq!(wire["tool_choice"]["disable_parallel_tool_use"], true);
     }
@@ -371,12 +388,32 @@ mod tests {
     }
 
     #[test]
+    fn serialized_request_limit_includes_system_and_json_escaping() {
+        let tools = ToolCatalog::without_workspace().definitions();
+        let system = "synthetic operator text\n";
+        let overhead = encode_request(system, &[Message::user(String::new())], &tools)
+            .unwrap()
+            .len();
+        let messages = [Message::user("x".repeat(MAX_REQUEST_BYTES - overhead))];
+        assert_eq!(
+            encode_request(system, &messages, &tools).unwrap().len(),
+            MAX_REQUEST_BYTES
+        );
+        assert!(encode_request(&format!("{system}x"), &messages, &tools).is_err());
+        // Same UTF-8 byte count, but a newline needs an extra JSON escape byte.
+        let escaped = system.replacen('s', "\n", 1);
+        assert_eq!(escaped.len(), system.len());
+        assert!(encode_request(&escaped, &messages, &tools).is_err());
+        assert!(encode_request("", &messages, &tools).is_ok());
+    }
+
+    #[test]
     fn request_size_and_status_boundaries_are_explicit() {
         assert!(check_request_size(MAX_REQUEST_BYTES).is_ok());
         assert!(check_request_size(MAX_REQUEST_BYTES + 1).is_err());
         let tools = ToolCatalog::without_workspace().definitions();
         let oversized = Message::user("x".repeat(MAX_REQUEST_BYTES));
-        assert!(encode_request(&[oversized], &tools).is_err());
+        assert!(encode_request("synthetic system", &[oversized], &tools).is_err());
         assert!(check_status(200).is_ok());
         assert!(check_status(401).unwrap_err().contains("authentication"));
         assert!(check_status(500).unwrap_err().contains("unexpected"));

@@ -3,7 +3,7 @@ mod anthropic;
 mod cli;
 mod tools;
 
-use agent::Agent;
+use agent::{Agent, compose_instructions};
 use clap::Parser;
 use cli::{Cli, StdinEvent};
 use std::{
@@ -41,20 +41,20 @@ fn api_key() -> Result<String, String> {
     }
 }
 
-fn run_once(message: String, tools: ToolCatalog) -> Result<(), String> {
+fn run_once(message: String, tools: ToolCatalog, system: String) -> Result<(), String> {
     let key = api_key()?;
-    let mut agent = Agent::new(key, tools)?;
+    let mut agent = Agent::new(key, tools, system)?;
     let mut output = std::io::stdout().lock();
     agent.run_turn(message, &mut output)
 }
 
-fn run_stdin(tools: ToolCatalog) -> Result<(), String> {
+fn run_stdin(tools: ToolCatalog, system: String) -> Result<(), String> {
     let stdin = std::io::stdin();
     let show_prompt = stdin.is_terminal();
     let mut input = stdin.lock();
     let mut output = std::io::stdout().lock();
     let mut error_output = std::io::stderr().lock();
-    let mut tools = Some(tools);
+    let mut startup = Some((tools, system));
     let mut agent = None;
 
     loop {
@@ -69,10 +69,8 @@ fn run_stdin(tools: ToolCatalog) -> Result<(), String> {
             StdinEvent::Message(message) => {
                 if agent.is_none() {
                     let key = api_key()?;
-                    agent = Some(Agent::new(
-                        key,
-                        tools.take().expect("agent is initialized only once"),
-                    )?);
+                    let (tools, system) = startup.take().expect("agent is initialized only once");
+                    agent = Some(Agent::new(key, tools, system)?);
                 }
                 agent
                     .as_mut()
@@ -83,13 +81,22 @@ fn run_stdin(tools: ToolCatalog) -> Result<(), String> {
     }
 }
 
+fn load_instructions(
+    tools: &ToolCatalog,
+    path: Option<&std::path::Path>,
+) -> Result<String, String> {
+    let operator = path.map(|path| tools.read_instructions(path)).transpose()?;
+    Ok(compose_instructions(operator.as_deref()))
+}
+
 fn run() -> Result<(), String> {
     let cli = Cli::parse();
     let message = cli.message.map(cli::validate_message).transpose()?;
     let tools = ToolCatalog::open(cli.workspace.as_deref())?;
+    let system = load_instructions(&tools, cli.instructions.as_deref())?;
     match message {
-        Some(message) => run_once(message, tools),
-        None => run_stdin(tools),
+        Some(message) => run_once(message, tools, system),
+        None => run_stdin(tools, system),
     }
 }
 
@@ -106,6 +113,83 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn startup_loads_only_the_selected_file_and_preserves_text() {
+        use std::{fs, path::Path};
+        let directory = tempfile::tempdir().unwrap();
+        let tools = ToolCatalog::open(Some(directory.path())).unwrap();
+        fs::write(directory.path().join("AGENTS.md"), "not selected").unwrap();
+        assert_eq!(
+            load_instructions(&tools, None).unwrap(),
+            compose_instructions(None)
+        );
+        for text in ["", "  synthetic operator text\n世界\n  "] {
+            fs::write(directory.path().join("instructions.txt"), text).unwrap();
+            let system = load_instructions(&tools, Some(Path::new("instructions.txt"))).unwrap();
+            assert_eq!(
+                system,
+                format!(
+                    "{}\n\nOperator instructions:\n\n{text}",
+                    compose_instructions(None)
+                )
+            );
+        }
+        let disabled = ToolCatalog::without_workspace();
+        assert_eq!(
+            load_instructions(&disabled, None).unwrap(),
+            compose_instructions(None)
+        );
+        assert!(load_instructions(&disabled, Some(Path::new("instructions.txt"))).is_err());
+    }
+
+    #[test]
+    fn invalid_instruction_selections_fail_during_local_startup() {
+        use std::{fs, path::Path};
+        let directory = tempfile::tempdir().unwrap();
+        let tools = ToolCatalog::open(Some(directory.path())).unwrap();
+        fs::write(
+            directory.path().join("large.txt"),
+            vec![b'x'; 32 * 1024 + 1],
+        )
+        .unwrap();
+        fs::write(directory.path().join("invalid.bin"), [0xff]).unwrap();
+        fs::write(directory.path().join(".hidden"), "synthetic").unwrap();
+        fs::create_dir(directory.path().join("directory")).unwrap();
+        for path in [
+            "",
+            "missing",
+            "large.txt",
+            "invalid.bin",
+            ".hidden",
+            "../outside",
+            "/absolute",
+            "./relative",
+            ".",
+            "directory",
+        ] {
+            assert!(
+                load_instructions(&tools, Some(Path::new(path))).is_err(),
+                "accepted {path}"
+            );
+        }
+        fs::write(directory.path().join("boundary.txt"), vec![b'x'; 32 * 1024]).unwrap();
+        assert!(load_instructions(&tools, Some(Path::new("boundary.txt"))).is_ok());
+        #[cfg(unix)]
+        {
+            use std::os::unix::{ffi::OsStringExt, fs::symlink};
+            symlink("boundary.txt", directory.path().join("file-link")).unwrap();
+            symlink("directory", directory.path().join("dir-link")).unwrap();
+            fs::write(directory.path().join("directory/file.txt"), "synthetic").unwrap();
+            for path in ["file-link", "dir-link/file.txt"] {
+                assert!(load_instructions(&tools, Some(Path::new(path))).is_err());
+            }
+            let invalid = std::ffi::OsString::from_vec(vec![0xff]);
+            assert!(load_instructions(&tools, Some(Path::new(&invalid))).is_err());
+            let devices = ToolCatalog::open(Some(Path::new("/dev"))).unwrap();
+            assert!(load_instructions(&devices, Some(Path::new("null"))).is_err());
+        }
+    }
 
     #[test]
     fn dotenv_parsing_is_offline_and_errors_do_not_expose_contents() {

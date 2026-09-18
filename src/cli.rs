@@ -12,6 +12,8 @@ pub(crate) const MAX_MESSAGE_BYTES: usize = 16 * 1024;
 pub(crate) struct Cli {
     #[arg(long, value_name = "PATH")]
     pub(crate) workspace: Option<PathBuf>,
+    #[arg(long, value_name = "PATH", requires = "workspace")]
+    pub(crate) instructions: Option<PathBuf>,
     #[arg(value_name = "MESSAGE")]
     pub(crate) message: Option<OsString>,
 }
@@ -91,6 +93,20 @@ mod tests {
         assert_eq!(parsed.message, Some("one message with spaces".into()));
 
         assert!(Cli::try_parse_from(["program", "one", "two"]).is_err());
+    }
+
+    #[test]
+    fn instructions_require_an_explicit_workspace() {
+        assert!(Cli::try_parse_from(["program", "--instructions", "instructions.txt"]).is_err());
+        let parsed = Cli::try_parse_from([
+            "program",
+            "--workspace",
+            "example",
+            "--instructions",
+            "instructions.txt",
+        ])
+        .unwrap();
+        assert_eq!(parsed.instructions, Some(PathBuf::from("instructions.txt")));
     }
 
     #[test]
