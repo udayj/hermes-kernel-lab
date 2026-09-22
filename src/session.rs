@@ -3,7 +3,7 @@ use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt};
 use cap_std::{ambient_authority, fs::Dir};
 use serde::{Deserialize, Serialize};
 use std::{
-    fs::{self, File},
+    fs,
     io::{self, Read, Write},
     path::{Path, PathBuf},
 };
@@ -180,14 +180,14 @@ impl Checkpoint {
         // concurrent writers or replacement of the directory are unsupported.
         let mut staged = tempfile::NamedTempFile::new_in(self.path.parent().unwrap())
             .map_err(|_| "could not stage checkpoint")?;
-        serde_json::to_writer(
-            LimitedWriter {
-                file: staged.as_file_mut(),
-                remaining: MAX_SESSION_BYTES,
-            },
-            session,
-        )
-        .map_err(|_| "could not encode/write checkpoint within the 2 MiB limit")?;
+        let mut buffer = vec![0; MAX_SESSION_BYTES];
+        let mut remaining = buffer.as_mut_slice();
+        serde_json::to_writer(&mut remaining, session)
+            .map_err(|_| "could not encode checkpoint within the 2 MiB limit")?;
+        let used = MAX_SESSION_BYTES - remaining.len();
+        staged
+            .write_all(&buffer[..used])
+            .map_err(|_| "could not write checkpoint")?;
         staged
             .flush()
             .and_then(|()| staged.as_file().sync_all())
@@ -209,26 +209,6 @@ impl Checkpoint {
         };
         self.saved_this_run = true;
         Ok(notice)
-    }
-}
-
-struct LimitedWriter<'a> {
-    file: &'a mut File,
-    remaining: usize,
-}
-
-impl Write for LimitedWriter<'_> {
-    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        if bytes.len() > self.remaining {
-            return Err(io::Error::other("checkpoint size limit"));
-        }
-        let written = self.file.write(bytes)?;
-        self.remaining -= written;
-        Ok(written)
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        self.file.flush()
     }
 }
 

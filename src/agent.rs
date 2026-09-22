@@ -434,7 +434,7 @@ mod tests {
 
         for failure in ["model", "output", "save", "budget"] {
             let mut session = checkpoint.load().unwrap();
-            // Make serialization exceed its bound without a large allocation in the writer.
+            // Force serialization beyond the checkpoint byte limit.
             if failure == "save" {
                 session.system = "x".repeat(2 * 1024 * 1024);
             }
