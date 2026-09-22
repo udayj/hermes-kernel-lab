@@ -4,33 +4,33 @@ use std::{
     path::PathBuf,
 };
 
-pub(crate) const MAX_MESSAGE_BYTES: usize = 16 * 1024;
+pub const MAX_MESSAGE_BYTES: usize = 16 * 1024;
 
 #[derive(Debug, Parser)]
 #[command(name = "hermes-kernel-lab")]
-pub(crate) struct Cli {
+pub struct Cli {
     #[arg(long, value_name = "PATH")]
-    pub(crate) workspace: Option<PathBuf>,
+    pub workspace: Option<PathBuf>,
     #[arg(
         long,
         value_name = "PATH",
         requires = "workspace",
         conflicts_with = "resume_session"
     )]
-    pub(crate) instructions: Option<PathBuf>,
+    pub instructions: Option<PathBuf>,
     #[arg(long, value_name = "PATH")]
-    pub(crate) resume_session: Option<PathBuf>,
+    pub resume_session: Option<PathBuf>,
 }
 
 #[derive(Debug, PartialEq)]
-pub(crate) enum StdinEvent {
+pub enum StdinEvent {
     Message(String),
     Blank,
     Exit,
     Eof,
 }
 
-pub(crate) fn validate_text(message: &str) -> Result<(), String> {
+pub fn validate_text(message: &str) -> Result<(), String> {
     if message.trim().is_empty() {
         return Err("user message must not be blank".into());
     }
@@ -40,7 +40,7 @@ pub(crate) fn validate_text(message: &str) -> Result<(), String> {
     Ok(())
 }
 
-pub(crate) fn read_stdin_event(reader: &mut impl BufRead) -> Result<StdinEvent, String> {
+pub fn read_stdin_event(reader: &mut impl BufRead) -> Result<StdinEvent, String> {
     let mut bytes = Vec::new();
     let bytes_read = reader
         .take(MAX_MESSAGE_BYTES as u64 + 3)
@@ -71,7 +71,7 @@ pub(crate) fn read_stdin_event(reader: &mut impl BufRead) -> Result<StdinEvent, 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Cursor;
+    use std::{io::Cursor, iter::once};
 
     #[test]
     fn parses_stdin_options_and_rejects_removed_modes() {
@@ -100,7 +100,7 @@ mod tests {
                 "session.json",
             ],
         ] {
-            assert!(Cli::try_parse_from(std::iter::once("program").chain(args)).is_err());
+            assert!(Cli::try_parse_from(once("program").chain(args)).is_err());
         }
     }
 

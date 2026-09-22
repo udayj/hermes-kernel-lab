@@ -2,24 +2,28 @@ mod workspace;
 
 use self::workspace::Workspace;
 use serde::Serialize;
-use serde_json::{Value, json};
-use std::{env, path::Path};
+use serde_json::{Value, json, to_string};
+use std::{
+    env::consts::{ARCH, OS},
+    path::Path,
+    thread::available_parallelism,
+};
 
 const RUNTIME_TOOL: &str = "get_runtime_info";
 const LIST_TOOL: &str = "list_directory";
 const READ_TOOL: &str = "read_file";
 
 #[derive(Debug, Serialize)]
-pub(crate) struct ToolDefinition {
-    pub(crate) name: &'static str,
+pub struct ToolDefinition {
+    pub name: &'static str,
     description: &'static str,
     input_schema: Value,
 }
 
 #[derive(Debug)]
-pub(crate) struct ToolOutcome {
-    pub(crate) content: String,
-    pub(crate) is_error: bool,
+pub struct ToolOutcome {
+    pub content: String,
+    pub is_error: bool,
 }
 
 impl ToolOutcome {
@@ -38,29 +42,29 @@ impl ToolOutcome {
     }
 }
 
-pub(crate) struct ToolCatalog {
+pub struct ToolCatalog {
     workspace: Option<Workspace>,
 }
 
 impl ToolCatalog {
-    pub(crate) fn open(workspace: Option<&Path>) -> Result<Self, String> {
+    pub fn open(workspace: Option<&Path>) -> Result<Self, String> {
         let workspace = workspace.map(Workspace::open).transpose()?;
         Ok(Self { workspace })
     }
 
     #[cfg(test)]
-    pub(crate) fn without_workspace() -> Self {
+    pub fn without_workspace() -> Self {
         Self { workspace: None }
     }
 
-    pub(crate) fn default_instructions(&self) -> Result<Option<String>, String> {
+    pub fn default_instructions(&self) -> Result<Option<String>, String> {
         match &self.workspace {
             Some(workspace) => workspace.default_instructions(),
             None => Ok(None),
         }
     }
 
-    pub(crate) fn read_instructions(&self, path: &Path) -> Result<String, String> {
+    pub fn read_instructions(&self, path: &Path) -> Result<String, String> {
         let workspace = self
             .workspace
             .as_ref()
@@ -73,7 +77,7 @@ impl ToolCatalog {
             .map_err(|error| format!("could not load instructions: {error}"))
     }
 
-    pub(crate) fn definitions(&self) -> Vec<ToolDefinition> {
+    pub fn definitions(&self) -> Vec<ToolDefinition> {
         let mut definitions = vec![runtime_definition()];
         if self.workspace.is_some() {
             definitions.push(list_definition());
@@ -82,7 +86,7 @@ impl ToolCatalog {
         definitions
     }
 
-    pub(crate) fn execute(&self, name: &str, input: &Value) -> ToolOutcome {
+    pub fn execute(&self, name: &str, input: &Value) -> ToolOutcome {
         let result = match name {
             RUNTIME_TOOL => validate_empty_object(input).and_then(|()| runtime_info()),
             LIST_TOOL => self
@@ -171,10 +175,10 @@ struct RuntimeInfo {
 }
 
 fn runtime_info() -> Result<String, String> {
-    serde_json::to_string(&RuntimeInfo {
-        target_os: env::consts::OS,
-        target_arch: env::consts::ARCH,
-        available_parallelism: std::thread::available_parallelism().map(|n| n.get()).ok(),
+    to_string(&RuntimeInfo {
+        target_os: OS,
+        target_arch: ARCH,
+        available_parallelism: available_parallelism().map(|n| n.get()).ok(),
     })
     .map_err(|_| "could not encode runtime information".into())
 }

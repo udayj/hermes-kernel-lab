@@ -1,10 +1,14 @@
 use crate::tools::ToolDefinition;
 use serde::{Deserialize, Serialize};
+use serde_json::{Value, from_slice, to_vec};
 use std::time::Duration;
-use ureq::http::{HeaderValue, Request};
+use ureq::{
+    Agent as HttpAgent, Error as HttpError,
+    http::{HeaderValue, Request},
+};
 
 const ENDPOINT: &str = "https://api.anthropic.com/v1/messages";
-pub(crate) const MODEL: &str = "claude-haiku-4-5-20251001";
+pub const MODEL: &str = "claude-haiku-4-5-20251001";
 const MAX_TOKENS: u32 = 512;
 const MAX_RESPONSE_BYTES: u64 = 1024 * 1024;
 const MAX_REQUEST_BYTES: usize = 1024 * 1024;
@@ -29,27 +33,27 @@ struct ToolChoice {
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct Message {
-    pub(crate) role: String,
-    pub(crate) content: Vec<ContentBlock>,
+pub struct Message {
+    pub role: String,
+    pub content: Vec<ContentBlock>,
 }
 
 impl Message {
-    pub(crate) fn user(text: String) -> Self {
+    pub fn user(text: String) -> Self {
         Self {
             role: "user".into(),
             content: vec![ContentBlock::Text { text }],
         }
     }
 
-    pub(crate) fn assistant(content: Vec<ContentBlock>) -> Self {
+    pub fn assistant(content: Vec<ContentBlock>) -> Self {
         Self {
             role: "assistant".into(),
             content,
         }
     }
 
-    pub(crate) fn tool_result(tool_use_id: String, content: String, is_error: bool) -> Self {
+    pub fn tool_result(tool_use_id: String, content: String, is_error: bool) -> Self {
         Self {
             role: "user".into(),
             content: vec![ContentBlock::ToolResult {
@@ -72,14 +76,14 @@ struct MessageResponse {
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(tag = "type")]
-pub(crate) enum ContentBlock {
+pub enum ContentBlock {
     #[serde(rename = "text")]
     Text { text: String },
     #[serde(rename = "tool_use")]
     ToolUse {
         id: String,
         name: String,
-        input: serde_json::Value,
+        input: Value,
     },
     #[serde(rename = "tool_result")]
     ToolResult {
@@ -97,27 +101,27 @@ fn is_false(value: &bool) -> bool {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct ToolCall {
-    pub(crate) id: String,
-    pub(crate) name: String,
-    pub(crate) input: serde_json::Value,
+pub struct ToolCall {
+    pub id: String,
+    pub name: String,
+    pub input: Value,
 }
 
 #[derive(Debug)]
-pub(crate) struct AssistantResponse {
-    pub(crate) content: Vec<ContentBlock>,
-    pub(crate) tool_call: Option<ToolCall>,
+pub struct AssistantResponse {
+    pub content: Vec<ContentBlock>,
+    pub tool_call: Option<ToolCall>,
 }
 
-pub(crate) struct Client {
-    agent: ureq::Agent,
+pub struct Client {
+    agent: HttpAgent,
     key: String,
 }
 
 impl Client {
-    pub(crate) fn new(key: String) -> Result<Self, String> {
+    pub fn new(key: String) -> Result<Self, String> {
         validate_key(&key)?;
-        let agent = ureq::Agent::config_builder()
+        let agent = HttpAgent::config_builder()
             .https_only(true)
             .max_redirects(0)
             .http_status_as_error(false)
@@ -127,7 +131,7 @@ impl Client {
         Ok(Self { agent, key })
     }
 
-    pub(crate) fn send(
+    pub fn send(
         &self,
         system: &str,
         messages: &[Message],
@@ -176,7 +180,7 @@ fn encode_request(
     messages: &[Message],
     tools: &[ToolDefinition],
 ) -> Result<Vec<u8>, String> {
-    let body = serde_json::to_vec(&MessageRequest {
+    let body = to_vec(&MessageRequest {
         model: MODEL,
         max_tokens: MAX_TOKENS,
         stream: false,
@@ -212,7 +216,7 @@ fn check_status(status: u16) -> Result<(), String> {
 }
 
 fn decode_response(body: &[u8]) -> Result<AssistantResponse, String> {
-    let response: MessageResponse = serde_json::from_slice(body)
+    let response: MessageResponse = from_slice(body)
         .map_err(|_| "Anthropic returned invalid JSON or an unexpected message schema")?;
     if response.kind != "message" || response.role != "assistant" {
         return Err("expected an Anthropic assistant message".into());
@@ -239,9 +243,7 @@ fn decode_response(body: &[u8]) -> Result<AssistantResponse, String> {
 }
 
 // Checkpoints share block validation, but HTTP still requires a valid stop reason.
-pub(crate) fn validate_assistant_content(
-    content: &[ContentBlock],
-) -> Result<Option<ToolCall>, String> {
+pub fn validate_assistant_content(content: &[ContentBlock]) -> Result<Option<ToolCall>, String> {
     let mut has_text = false;
     let mut tool_call = None;
     for block in content {
@@ -282,10 +284,10 @@ pub(crate) fn validate_assistant_content(
     Ok(tool_call)
 }
 
-fn transport_error(error: ureq::Error) -> String {
+fn transport_error(error: HttpError) -> String {
     match error {
-        ureq::Error::Timeout(_) => "Anthropic request timed out (60-second limit)",
-        ureq::Error::BodyExceedsLimit(_) => "Anthropic response exceeds the 1 MiB limit",
+        HttpError::Timeout(_) => "Anthropic request timed out (60-second limit)",
+        HttpError::BodyExceedsLimit(_) => "Anthropic response exceeds the 1 MiB limit",
         _ => "Anthropic transport failed; check connectivity, TLS, and proxy settings",
     }
     .into()
@@ -295,15 +297,15 @@ fn transport_error(error: ureq::Error) -> String {
 mod tests {
     use super::*;
     use crate::tools::ToolCatalog;
-    use serde_json::json;
+    use serde_json::{json, to_value};
 
-    fn response() -> serde_json::Value {
+    fn response() -> Value {
         json!({"type":"message", "role":"assistant", "stop_reason":"end_turn",
             "content":[{"type":"text", "text":"Hello "}, {"type":"text", "text":"世界!"}],
             "usage":{"input_tokens":8,"output_tokens":4}})
     }
 
-    fn tool_response(name: &str, input: serde_json::Value) -> serde_json::Value {
+    fn tool_response(name: &str, input: Value) -> Value {
         json!({"type":"message", "role":"assistant", "stop_reason":"tool_use",
             "content":[{"type":"tool_use", "id":"toolu_synthetic", "name":name,
                 "input":input}]})
@@ -323,7 +325,7 @@ mod tests {
         assert_eq!(request.method(), "POST");
         assert_eq!(request.uri(), ENDPOINT);
         assert!(request.headers()["x-api-key"].is_sensitive());
-        let wire: serde_json::Value = serde_json::from_slice(request.body()).unwrap();
+        let wire: Value = from_slice(request.body()).unwrap();
         assert_eq!(wire["system"], "synthetic system");
         assert_eq!(
             wire["messages"],
@@ -340,12 +342,9 @@ mod tests {
             .as_array_mut()
             .unwrap()
             .insert(0, json!({"type":"text","text":"Before"}));
-        let decoded = decode_response(&serde_json::to_vec(&body).unwrap()).unwrap();
+        let decoded = decode_response(&to_vec(&body).unwrap()).unwrap();
         assert_eq!(decoded.tool_call.unwrap().name, "future_tool");
-        assert_eq!(
-            serde_json::to_value(decoded.content).unwrap(),
-            body["content"]
-        );
+        assert_eq!(to_value(decoded.content).unwrap(), body["content"]);
     }
 
     #[test]
@@ -361,12 +360,12 @@ mod tests {
         ] {
             let mut body = response();
             body["content"] = content;
-            assert!(decode_response(&serde_json::to_vec(&body).unwrap()).is_err());
+            assert!(decode_response(&to_vec(&body).unwrap()).is_err());
         }
         for reason in ["max_tokens", "refusal", "unknown"] {
             let mut body = response();
             body["stop_reason"] = json!(reason);
-            assert!(decode_response(&serde_json::to_vec(&body).unwrap()).is_err());
+            assert!(decode_response(&to_vec(&body).unwrap()).is_err());
         }
         let valid = tool_response("get_runtime_info", json!({}))["content"][0].clone();
         for content in [
@@ -377,7 +376,7 @@ mod tests {
         ] {
             let mut body = tool_response("get_runtime_info", json!({}));
             body["content"] = content;
-            assert!(decode_response(&serde_json::to_vec(&body).unwrap()).is_err());
+            assert!(decode_response(&to_vec(&body).unwrap()).is_err());
         }
     }
 

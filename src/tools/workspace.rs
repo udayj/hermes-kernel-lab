@@ -4,8 +4,9 @@ use cap_std::{
     fs::{Dir, OpenOptions},
 };
 use serde::Serialize;
+use serde_json::{to_string, to_vec};
 use std::{
-    io::Read,
+    io::{ErrorKind, Read},
     path::{Component, Path},
 };
 
@@ -13,18 +14,18 @@ const MAX_FILE_BYTES: u64 = 32 * 1024;
 const MAX_DIRECTORY_ENTRIES: usize = 200;
 const MAX_DIRECTORY_OUTPUT_BYTES: usize = 32 * 1024;
 
-pub(super) struct Workspace {
+pub struct Workspace {
     root: Dir,
 }
 
 impl Workspace {
-    pub(super) fn open(path: &Path) -> Result<Self, String> {
+    pub fn open(path: &Path) -> Result<Self, String> {
         let root = Dir::open_ambient_dir(path, ambient_authority())
             .map_err(|_| "workspace must be an existing readable directory")?;
         Ok(Self { root })
     }
 
-    pub(super) fn list(&self, path: &str) -> Result<String, String> {
+    pub fn list(&self, path: &str) -> Result<String, String> {
         let components = validate_path(path, true)?;
         let directory = self.open_directory(&components)?;
         let mut entries = Vec::new();
@@ -60,7 +61,7 @@ impl Workspace {
                 "other"
             };
             let item = DirectoryEntry { name, kind };
-            let item_bytes = serde_json::to_vec(&item)
+            let item_bytes = to_vec(&item)
                 .map_err(|_| "could not encode the directory listing")?
                 .len();
             encoded_bytes += item_bytes + usize::from(!entries.is_empty());
@@ -70,19 +71,19 @@ impl Workspace {
             entries.push(item);
         }
         entries.sort_by(|left, right| left.name.cmp(&right.name));
-        serde_json::to_string(&entries).map_err(|_| "could not encode the directory listing".into())
+        to_string(&entries).map_err(|_| "could not encode the directory listing".into())
     }
 
-    pub(super) fn default_instructions(&self) -> Result<Option<String>, String> {
+    pub fn default_instructions(&self) -> Result<Option<String>, String> {
         // Inspect without following links: a dangling link is not an absent default.
         match self.root.symlink_metadata("AGENTS.md") {
             Ok(_) => self.read("AGENTS.md").map(Some),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
             Err(_) => Err("could not inspect root AGENTS.md".into()),
         }
     }
 
-    pub(super) fn read(&self, path: &str) -> Result<String, String> {
+    pub fn read(&self, path: &str) -> Result<String, String> {
         let components = validate_path(path, false)?;
         let (parent_components, leaf) = components.split_at(components.len() - 1);
         let parent = self.open_directory(parent_components)?;
@@ -172,8 +173,13 @@ struct DirectoryEntry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::{Value, json};
-    use std::{fs, io::Write};
+    use serde_json::{Value, from_str, json};
+    #[cfg(unix)]
+    use std::os::unix::fs::symlink;
+    use std::{
+        fs::{File, create_dir, write},
+        io::Write,
+    };
     use tempfile::TempDir;
 
     fn temporary_workspace() -> (TempDir, Workspace) {
@@ -185,13 +191,13 @@ mod tests {
     #[test]
     fn lists_one_directory_in_sorted_order_and_marks_symlinks() {
         let (temporary, workspace) = temporary_workspace();
-        fs::write(temporary.path().join("z.txt"), "z").unwrap();
-        fs::create_dir(temporary.path().join("a-dir")).unwrap();
-        fs::write(temporary.path().join(".env"), "secret").unwrap();
+        write(temporary.path().join("z.txt"), "z").unwrap();
+        create_dir(temporary.path().join("a-dir")).unwrap();
+        write(temporary.path().join(".env"), "secret").unwrap();
         #[cfg(unix)]
-        std::os::unix::fs::symlink("z.txt", temporary.path().join("m-link")).unwrap();
+        symlink("z.txt", temporary.path().join("m-link")).unwrap();
 
-        let entries: Value = serde_json::from_str(&workspace.list(".").unwrap()).unwrap();
+        let entries: Value = from_str(&workspace.list(".").unwrap()).unwrap();
         #[cfg(unix)]
         assert_eq!(
             entries,
@@ -215,7 +221,7 @@ mod tests {
     fn directory_limits_fail_instead_of_returning_partial_results() {
         let (temporary, workspace) = temporary_workspace();
         for index in 0..=MAX_DIRECTORY_ENTRIES {
-            fs::write(temporary.path().join(format!("entry-{index:03}")), "").unwrap();
+            write(temporary.path().join(format!("entry-{index:03}")), "").unwrap();
         }
         let error = workspace.list(".").unwrap_err();
         assert!(error.contains("200-entry"));
@@ -223,7 +229,7 @@ mod tests {
         let (temporary, workspace) = temporary_workspace();
         let long = "x".repeat(240);
         for index in 0..150 {
-            fs::write(temporary.path().join(format!("{index:03}-{long}")), "").unwrap();
+            write(temporary.path().join(format!("{index:03}-{long}")), "").unwrap();
         }
         let error = workspace.list(".").unwrap_err();
         assert!(error.contains("32 KiB"));
@@ -238,10 +244,10 @@ mod tests {
             ("unicode.txt", "नमस्ते 世界".to_string()),
             ("boundary.txt", "x".repeat(MAX_FILE_BYTES as usize)),
         ] {
-            fs::write(temporary.path().join(name), &content).unwrap();
+            write(temporary.path().join(name), &content).unwrap();
             assert_eq!(workspace.read(name).unwrap(), content);
         }
-        fs::write(
+        write(
             temporary.path().join("large.txt"),
             "x".repeat(MAX_FILE_BYTES as usize + 1),
         )
@@ -252,9 +258,9 @@ mod tests {
     #[test]
     fn rejects_missing_invalid_utf8_and_denied_paths() {
         let (temporary, workspace) = temporary_workspace();
-        fs::write(temporary.path().join("invalid.bin"), [0xff, 0xfe]).unwrap();
-        fs::write(temporary.path().join(".hidden"), "hidden").unwrap();
-        fs::create_dir(temporary.path().join("dir")).unwrap();
+        write(temporary.path().join("invalid.bin"), [0xff, 0xfe]).unwrap();
+        write(temporary.path().join(".hidden"), "hidden").unwrap();
+        create_dir(temporary.path().join("dir")).unwrap();
         for path in [
             "missing",
             "invalid.bin",
@@ -277,11 +283,10 @@ mod tests {
     #[test]
     fn rejects_symlink_traversal_and_special_files_on_the_tested_host() {
         let (temporary, workspace) = temporary_workspace();
-        fs::create_dir(temporary.path().join("real-dir")).unwrap();
-        fs::write(temporary.path().join("real-dir/file.txt"), "content").unwrap();
-        std::os::unix::fs::symlink("real-dir", temporary.path().join("dir-link")).unwrap();
-        std::os::unix::fs::symlink("real-dir/file.txt", temporary.path().join("file-link"))
-            .unwrap();
+        create_dir(temporary.path().join("real-dir")).unwrap();
+        write(temporary.path().join("real-dir/file.txt"), "content").unwrap();
+        symlink("real-dir", temporary.path().join("dir-link")).unwrap();
+        symlink("real-dir/file.txt", temporary.path().join("file-link")).unwrap();
 
         for path in ["dir-link/file.txt", "file-link"] {
             assert!(workspace.read(path).is_err());
@@ -297,7 +302,7 @@ mod tests {
     fn workspace_must_exist_and_be_a_directory() {
         let temporary = TempDir::new().unwrap();
         let file = temporary.path().join("file");
-        fs::File::create(&file).unwrap().write_all(b"x").unwrap();
+        File::create(&file).unwrap().write_all(b"x").unwrap();
         assert!(Workspace::open(&file).is_err());
         assert!(Workspace::open(&temporary.path().join("missing")).is_err());
     }
