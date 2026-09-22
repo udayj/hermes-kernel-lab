@@ -73,10 +73,27 @@ impl Workspace {
         serde_json::to_string(&entries).map_err(|_| "could not encode the directory listing".into())
     }
 
+    pub(super) fn default_instructions(&self) -> Result<Option<String>, String> {
+        // Inspect without following links: a dangling link is not an absent default.
+        match self.root.symlink_metadata("AGENTS.md") {
+            Ok(_) => self.read("AGENTS.md").map(Some),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(_) => Err("could not inspect root AGENTS.md".into()),
+        }
+    }
+
     pub(super) fn read(&self, path: &str) -> Result<String, String> {
         let components = validate_path(path, false)?;
         let (parent_components, leaf) = components.split_at(components.len() - 1);
         let parent = self.open_directory(parent_components)?;
+        // Reject special files before open (opening a FIFO could otherwise block).
+        if !parent
+            .symlink_metadata(&leaf[0])
+            .map_err(|_| "could not inspect the requested file")?
+            .is_file()
+        {
+            return Err("requested path is not a regular file".into());
+        }
         let mut options = OpenOptions::new();
         options.read(true).follow(FollowSymlinks::No);
         let file = parent

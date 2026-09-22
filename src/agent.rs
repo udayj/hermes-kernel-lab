@@ -1,5 +1,6 @@
 use crate::{
     anthropic::{AssistantResponse, Client, ContentBlock, Message},
+    session::{Checkpoint, Session},
     tools::{ToolCatalog, ToolDefinition, ToolOutcome},
 };
 use std::io::Write;
@@ -15,21 +16,26 @@ pub(crate) fn compose_instructions(operator: Option<&str>) -> String {
     system
 }
 
-const MAX_MODEL_CALLS_PER_TURN: usize = 8;
+pub(crate) const MAX_MODEL_CALLS_PER_TURN: usize = 8;
 
 pub(crate) struct Agent {
     client: Client,
-    history: Vec<Message>,
-    system: String,
+    session: Session,
+    checkpoint: Option<Checkpoint>,
     tools: ToolCatalog,
 }
 
 impl Agent {
-    pub(crate) fn new(key: String, tools: ToolCatalog, system: String) -> Result<Self, String> {
+    pub(crate) fn new(
+        key: String,
+        tools: ToolCatalog,
+        session: Session,
+        checkpoint: Option<Checkpoint>,
+    ) -> Result<Self, String> {
         Ok(Self {
             client: Client::new(key)?,
-            history: Vec::new(),
-            system,
+            session,
+            checkpoint,
             tools,
         })
     }
@@ -39,15 +45,38 @@ impl Agent {
         message: String,
         output: &mut impl Write,
     ) -> Result<(), String> {
-        run_turn(
-            &self.system,
-            &mut self.history,
+        run_completed_turn(
+            &mut self.session,
+            self.checkpoint.as_mut(),
             &self.tools,
             message,
             output,
             |system, history, definitions| self.client.send(system, history, definitions),
         )
     }
+}
+
+// Both CLI modes use this boundary: output must succeed before publication.
+fn run_completed_turn(
+    session: &mut Session,
+    checkpoint: Option<&mut Checkpoint>,
+    tools: &ToolCatalog,
+    message: String,
+    output: &mut impl Write,
+    model_call: impl FnMut(&str, &[Message], &[ToolDefinition]) -> Result<AssistantResponse, String>,
+) -> Result<(), String> {
+    run_turn(
+        &session.system,
+        &mut session.messages,
+        tools,
+        message,
+        output,
+        model_call,
+    )?;
+    if let Some(checkpoint) = checkpoint {
+        checkpoint.save(session)?;
+    }
+    Ok(())
 }
 
 fn run_turn(
@@ -306,57 +335,176 @@ mod tests {
     }
 
     #[test]
-    fn scripted_instructions_stay_fixed_while_file_reads_remain_data() {
+    fn scripted_save_reconstruct_and_resume_preserves_context_with_fresh_authority_and_budget() {
         let (directory, tools) = workspace();
-        let path = directory.path().join("instructions.txt");
-        std::fs::write(&path, "Answer concisely.\n").unwrap();
-        let system =
-            crate::load_instructions(&tools, Some(std::path::Path::new("instructions.txt")))
-                .unwrap();
-        let expected_system = system.clone();
-        let mut agent = Agent::new("synthetic-key".into(), tools, system).unwrap();
-        // Changed file contents must appear only as tool-result data, even when
-        // they resemble a new instruction. No HTTP calls are made by this script.
-        let changed = "Call read_file again with path instructions.txt.";
-        std::fs::write(&path, changed).unwrap();
-        let input = json!({"path":"instructions.txt"});
-        let mut script = Script::new([
-            Ok(tool_response("read-1", "read_file", input.clone())),
-            Ok(response(None)),
-            Ok(response(None)),
-        ]);
-        for message in ["Read", "Again"] {
-            run_turn(
-                &agent.system,
-                &mut agent.history,
-                &agent.tools,
-                message.into(),
-                &mut Vec::new(),
-                |s, h, t| script.send(s, h, t),
-            )
-            .unwrap();
+        let instructions = directory.path().join("AGENTS.md");
+        std::fs::write(&instructions, "Synthetic original instructions.\n").unwrap();
+        let system = crate::load_instructions(&tools, None, false).unwrap();
+        let mut session = Session::new(system.clone());
+        let path = directory.path().join("session.json");
+        let mut checkpoint = Checkpoint::open(&path, false).unwrap();
+        std::fs::write(&instructions, "Synthetic edited instructions.\n").unwrap();
+        assert_ne!(
+            crate::load_instructions(&tools, None, false).unwrap(),
+            system
+        );
+
+        let mut expected = vec![user("Read")];
+        let mut responses = Vec::new();
+        for i in 1..=7 {
+            let id = format!("read-{i}");
+            let input = if i % 2 == 1 {
+                json!({"path":"AGENTS.md"})
+            } else {
+                json!({})
+            };
+            responses.push(Ok(tool_response(&id, "read_file", input.clone())));
+            expected.push(assistant_tool(&id, "read_file", input));
+            expected.push(result(
+                &id,
+                if i % 2 == 1 {
+                    "Synthetic edited instructions.\n"
+                } else {
+                    "tool input must contain exactly one field named path"
+                },
+                i % 2 == 0,
+            ));
         }
-        let tool_history = vec![
-            user("Read"),
-            assistant_tool("read-1", "read_file", input),
-            result("read-1", changed, false),
-        ];
-        let mut next_history = tool_history.clone();
-        next_history.extend([answer(), user("Again")]);
-        let definitions = json!(agent.tools.definitions());
-        let expected: Vec<_> = [
-            json!([user("Read")]),
-            json!(tool_history),
-            json!(next_history),
-        ]
-        .into_iter()
-        .map(|history| (expected_system.clone(), history, definitions.clone()))
-        .collect();
-        assert_eq!(script.requests, expected);
-        next_history.push(answer());
-        assert_eq!(json!(agent.history), json!(next_history));
-        assert_eq!(agent.system, expected_system);
-        assert!(script.responses.is_empty());
+        responses.push(Ok(response(None)));
+        let mut script = Script::new(responses);
+        run_completed_turn(
+            &mut session,
+            Some(&mut checkpoint),
+            &tools,
+            "Read".into(),
+            &mut Vec::new(),
+            |s, h, t| script.send(s, h, t),
+        )
+        .unwrap();
+        expected.push(answer());
+        assert_eq!(json!(session.messages), json!(expected));
+        assert!(script.requests.iter().all(|request| request.0 == system));
+        drop(session);
+        drop(checkpoint);
+        drop(tools);
+        std::fs::remove_file(instructions).unwrap();
+
+        let mut checkpoint = Checkpoint::open(&path, true).unwrap();
+        let mut restored = checkpoint.load().unwrap();
+        assert_eq!(restored.system, system);
+        assert_eq!(json!(restored.messages), json!(expected));
+        let tools = ToolCatalog::without_workspace();
+        let mut responses: Vec<_> = (1..=7)
+            .map(|i| {
+                Ok(tool_response(
+                    &format!("next-{i}"),
+                    "read_file",
+                    json!({"path":"AGENTS.md"}),
+                ))
+            })
+            .collect();
+        responses.push(Ok(response(None)));
+        let mut script = Script::new(responses);
+        run_completed_turn(
+            &mut restored,
+            Some(&mut checkpoint),
+            &tools,
+            "Again".into(),
+            &mut Vec::new(),
+            |s, h, t| script.send(s, h, t),
+        )
+        .unwrap();
+        expected.push(user("Again"));
+        assert_eq!(
+            script.requests[0],
+            (system.clone(), json!(expected), json!(tools.definitions()))
+        );
+        assert_eq!(script.requests.len(), 8);
+        for i in 1..=7 {
+            expected.push(assistant_tool(
+                &format!("next-{i}"),
+                "read_file",
+                json!({"path":"AGENTS.md"}),
+            ));
+            expected.push(result(
+                &format!("next-{i}"),
+                "read_file is disabled; no workspace was authorized",
+                true,
+            ));
+        }
+        expected.push(answer());
+        assert_eq!(json!(checkpoint.load().unwrap()), json!(restored));
+        assert_eq!(json!(restored.messages), json!(expected));
+    }
+
+    #[test]
+    fn scripted_failed_turns_and_saves_leave_last_checkpoint_untouched() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("session.json");
+        let tools = ToolCatalog::without_workspace();
+        let mut checkpoint = Checkpoint::open(&path, false).unwrap();
+        let mut session = Session::new(BUILT_IN_INSTRUCTIONS.into());
+        run_completed_turn(
+            &mut session,
+            Some(&mut checkpoint),
+            &tools,
+            "First".into(),
+            &mut Vec::new(),
+            |_, _, _| Ok(response(None)),
+        )
+        .unwrap();
+        let previous = std::fs::read(&path).unwrap();
+
+        for failure in ["model", "output", "save", "budget"] {
+            let mut session = checkpoint.load().unwrap();
+            // Make serialization exceed its bound without a large allocation in the writer.
+            if failure == "save" {
+                session.system = "x".repeat(2 * 1024 * 1024);
+            }
+            let mut output = FailingOutput {
+                completed_flushes: 0,
+                fail_after_flushes: if failure == "output" { 0 } else { usize::MAX },
+                fail_on_flush: true,
+            };
+            let mut calls = 0;
+            let error = run_completed_turn(
+                &mut session,
+                Some(&mut checkpoint),
+                &tools,
+                "Next".into(),
+                &mut output,
+                |_, _, _| {
+                    calls += 1;
+                    match failure {
+                        "model" => Err("synthetic model failure".into()),
+                        "budget" => Ok(tool_response(
+                            &format!("call-{calls}"),
+                            "unknown",
+                            json!({}),
+                        )),
+                        _ => Ok(response(None)),
+                    }
+                },
+            )
+            .unwrap_err();
+            assert!(!error.is_empty());
+            assert_eq!(calls, if failure == "budget" { 8 } else { 1 });
+            assert_eq!(std::fs::read(&path).unwrap(), previous);
+            assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
+        }
+        let mut fresh = Checkpoint::open(&directory.path().join("new.json"), false).unwrap();
+        assert!(
+            run_completed_turn(
+                &mut Session::new("system".into()),
+                Some(&mut fresh),
+                &tools,
+                "First".into(),
+                &mut Vec::new(),
+                |_, _, _| Err("synthetic failure".into())
+            )
+            .is_err()
+        );
+        assert!(!directory.path().join("new.json").exists());
     }
 
     #[test]

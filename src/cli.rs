@@ -12,8 +12,14 @@ pub(crate) const MAX_MESSAGE_BYTES: usize = 16 * 1024;
 pub(crate) struct Cli {
     #[arg(long, value_name = "PATH")]
     pub(crate) workspace: Option<PathBuf>,
-    #[arg(long, value_name = "PATH", requires = "workspace")]
+    #[arg(long, value_name = "PATH", requires = "workspace", conflicts_with_all = ["no_project_instructions", "resume_session"])]
     pub(crate) instructions: Option<PathBuf>,
+    #[arg(long, conflicts_with = "resume_session")]
+    pub(crate) no_project_instructions: bool,
+    #[arg(long, value_name = "PATH", conflicts_with = "resume_session")]
+    pub(crate) save_session: Option<PathBuf>,
+    #[arg(long, value_name = "PATH")]
+    pub(crate) resume_session: Option<PathBuf>,
     #[arg(value_name = "MESSAGE")]
     pub(crate) message: Option<OsString>,
 }

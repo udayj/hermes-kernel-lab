@@ -4,7 +4,7 @@ use std::time::Duration;
 use ureq::http::{HeaderValue, Request};
 
 const ENDPOINT: &str = "https://api.anthropic.com/v1/messages";
-const MODEL: &str = "claude-haiku-4-5-20251001";
+pub(crate) const MODEL: &str = "claude-haiku-4-5-20251001";
 const MAX_TOKENS: u32 = 512;
 const MAX_RESPONSE_BYTES: u64 = 1024 * 1024;
 const MAX_REQUEST_BYTES: usize = 1024 * 1024;
@@ -27,30 +27,31 @@ struct ToolChoice {
     disable_parallel_tool_use: bool,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct Message {
-    role: &'static str,
-    content: Vec<ContentBlock>,
+    pub(crate) role: String,
+    pub(crate) content: Vec<ContentBlock>,
 }
 
 impl Message {
     pub(crate) fn user(text: String) -> Self {
         Self {
-            role: "user",
+            role: "user".into(),
             content: vec![ContentBlock::Text { text }],
         }
     }
 
     pub(crate) fn assistant(content: Vec<ContentBlock>) -> Self {
         Self {
-            role: "assistant",
+            role: "assistant".into(),
             content,
         }
     }
 
     pub(crate) fn tool_result(tool_use_id: String, content: String, is_error: bool) -> Self {
         Self {
-            role: "user",
+            role: "user".into(),
             content: vec![ContentBlock::ToolResult {
                 tool_use_id,
                 content,
@@ -80,11 +81,11 @@ pub(crate) enum ContentBlock {
         name: String,
         input: serde_json::Value,
     },
-    #[serde(rename = "tool_result", skip_deserializing)]
+    #[serde(rename = "tool_result")]
     ToolResult {
         tool_use_id: String,
         content: String,
-        #[serde(skip_serializing_if = "is_false")]
+        #[serde(default, skip_serializing_if = "is_false")]
         is_error: bool,
     },
     #[serde(other)]
@@ -227,9 +228,23 @@ fn decode_response(body: &[u8]) -> Result<AssistantResponse, String> {
         _ => return Err("response did not finish with end_turn or tool_use".into()),
     }
 
+    let tool_call = validate_assistant_content(&response.content)?;
+    if (response.stop_reason == "tool_use") != tool_call.is_some() {
+        return Err("response stop_reason is inconsistent with tool request content".into());
+    }
+    Ok(AssistantResponse {
+        content: response.content,
+        tool_call,
+    })
+}
+
+// Checkpoints share block validation, but HTTP still requires a valid stop reason.
+pub(crate) fn validate_assistant_content(
+    content: &[ContentBlock],
+) -> Result<Option<ToolCall>, String> {
     let mut has_text = false;
     let mut tool_call = None;
-    for block in &response.content {
+    for block in content {
         match block {
             ContentBlock::Text { text } => has_text |= !text.trim().is_empty(),
             ContentBlock::ToolUse { id, name, input } => {
@@ -261,16 +276,10 @@ fn decode_response(body: &[u8]) -> Result<AssistantResponse, String> {
         }
     }
 
-    if (response.stop_reason == "tool_use") != tool_call.is_some() {
-        return Err("response stop_reason is inconsistent with tool request content".into());
-    }
     if tool_call.is_none() && !has_text {
         return Err("response contains no usable text".into());
     }
-    Ok(AssistantResponse {
-        content: response.content,
-        tool_call,
-    })
+    Ok(tool_call)
 }
 
 fn transport_error(error: ureq::Error) -> String {
@@ -364,6 +373,7 @@ mod tests {
             json!([]),
             json!([{"type":"text","text":"  "}]),
             json!([{"type":"unknown"}]),
+            json!([{"type":"tool_result","tool_use_id":"call-1","content":"ok"}]),
         ] {
             let mut body = response();
             body["content"] = content;

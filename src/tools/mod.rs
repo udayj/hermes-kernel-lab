@@ -53,6 +53,13 @@ impl ToolCatalog {
         Self { workspace: None }
     }
 
+    pub(crate) fn default_instructions(&self) -> Result<Option<String>, String> {
+        match &self.workspace {
+            Some(workspace) => workspace.default_instructions(),
+            None => Ok(None),
+        }
+    }
+
     pub(crate) fn read_instructions(&self, path: &Path) -> Result<String, String> {
         let workspace = self
             .workspace
