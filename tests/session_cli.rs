@@ -27,9 +27,9 @@ fn cli_validates_before_credentials_and_no_turn_exits_never_write() {
         child.wait_with_output().unwrap()
     };
     for input in ["", "\n", "/exit\n"] {
-        let output = invoke(&["--save-session", "new.json"], input);
+        let output = invoke(&[], input);
         assert!(output.status.success(), "{:?}", output);
-        assert!(!directory.path().join("new.json").exists());
+        assert!(output.stderr.is_empty());
     }
     let path = directory.path().join("saved.json");
     let saved = br#"{"version":1,"provider":"anthropic","model":"claude-haiku-4-5-20251001",
@@ -50,14 +50,9 @@ fn cli_validates_before_credentials_and_no_turn_exits_never_write() {
         assert_eq!(fs::read(&path).unwrap(), saved);
     }
     fs::write(&path, "not json").unwrap();
-    for args in [
-        vec!["--resume-session", "saved.json"],
-        vec!["--resume-session", "saved.json", "Hello"],
-    ] {
-        let output = invoke(&args, "");
-        assert!(!output.status.success());
-        let error = String::from_utf8(output.stderr).unwrap();
-        assert!(error.contains("checkpoint"), "{error}");
-        assert!(!error.contains("ANTHROPIC_API_KEY"), "{error}");
-    }
+    let output = invoke(&["--resume-session", "saved.json"], "Hello\n");
+    assert!(!output.status.success());
+    let error = String::from_utf8(output.stderr).unwrap();
+    assert!(error.contains("checkpoint"), "{error}");
+    assert!(!error.contains("ANTHROPIC_API_KEY"), "{error}");
 }

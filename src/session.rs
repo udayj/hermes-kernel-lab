@@ -80,9 +80,35 @@ impl Session {
 pub(crate) struct Checkpoint {
     path: PathBuf,
     existing: bool,
+    saved_this_run: bool,
 }
 
 impl Checkpoint {
+    pub(crate) fn automatic(home: &Path) -> Result<Self, String> {
+        if !home.is_absolute() || !home.is_dir() {
+            return Err("HOME must name an existing absolute directory".into());
+        }
+        let directory = home.join(".hermes-kernel-lab/sessions");
+        let mut builder = fs::DirBuilder::new();
+        builder.recursive(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        builder
+            .create(&directory)
+            .map_err(|_| "could not create session directory")?;
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|_| "system clock is before the Unix epoch")?
+            .as_nanos();
+        // Time plus process ID selects a name; no-clobber publication still
+        // refuses a collision rather than overwriting another conversation.
+        let path = directory.join(format!("{timestamp}-{}.json", std::process::id()));
+        Self::open(&path, false)
+    }
+
     pub(crate) fn open(path: &Path, existing: bool) -> Result<Self, String> {
         let name = path.file_name().ok_or("checkpoint must name a file")?;
         let parent = path
@@ -98,6 +124,7 @@ impl Checkpoint {
         let checkpoint = Self {
             path: parent.join(name),
             existing,
+            saved_this_run: false,
         };
         checkpoint.check_destination()?;
         Ok(checkpoint)
@@ -145,7 +172,8 @@ impl Checkpoint {
         Ok(session)
     }
 
-    pub(crate) fn save(&mut self, session: &Session) -> Result<(), String> {
+    // Return the path only on the first successful save in this invocation.
+    pub(crate) fn save(&mut self, session: &Session) -> Result<Option<PathBuf>, String> {
         session.validate()?;
         self.check_destination()?;
         // tempfile creates private files (0600 on Unix). The parent is trusted;
@@ -174,7 +202,13 @@ impl Checkpoint {
         // No fallible operation after publication. Directory durability across
         // power loss is deliberately not promised.
         self.existing = true;
-        Ok(())
+        let notice = if self.saved_this_run {
+            None
+        } else {
+            Some(self.path.clone())
+        };
+        self.saved_this_run = true;
+        Ok(notice)
     }
 }
 
@@ -282,6 +316,36 @@ mod tests {
         }
         fs::write(&path, serde_json::to_vec(&correlated).unwrap()).unwrap();
         assert!(Checkpoint::open(&path, true).unwrap().load().is_ok());
+    }
+
+    #[test]
+    fn automatic_sessions_report_only_the_first_successful_save() {
+        let home = tempfile::tempdir().unwrap();
+        let mut checkpoint = Checkpoint::automatic(home.path()).unwrap();
+        let other = Checkpoint::automatic(home.path()).unwrap();
+        assert_ne!(checkpoint.path, other.path);
+        let directory = home.path().join(".hermes-kernel-lab/sessions");
+        assert_eq!(fs::read_dir(&directory).unwrap().count(), 0);
+        // A failed first turn/save must neither publish nor consume the notice.
+        assert!(checkpoint.save(&Session::new("synthetic".into())).is_err());
+        assert!(!checkpoint.path.exists());
+        let session = completed();
+        let path = checkpoint.save(&session).unwrap().unwrap();
+        assert_eq!(path.parent().unwrap(), directory.canonicalize().unwrap());
+        assert!(checkpoint.save(&session).unwrap().is_none());
+        assert_eq!(fs::read_dir(&directory).unwrap().count(), 1);
+        let mut resumed = Checkpoint::open(&path, true).unwrap();
+        let restored = resumed.load().unwrap();
+        assert_eq!(resumed.save(&restored).unwrap(), Some(path));
+        assert!(resumed.save(&restored).unwrap().is_none());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(directory).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+        }
     }
 
     #[test]

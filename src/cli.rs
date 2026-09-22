@@ -1,6 +1,5 @@
 use clap::Parser;
 use std::{
-    ffi::OsString,
     io::{BufRead, Read},
     path::PathBuf,
 };
@@ -12,16 +11,15 @@ pub(crate) const MAX_MESSAGE_BYTES: usize = 16 * 1024;
 pub(crate) struct Cli {
     #[arg(long, value_name = "PATH")]
     pub(crate) workspace: Option<PathBuf>,
-    #[arg(long, value_name = "PATH", requires = "workspace", conflicts_with_all = ["no_project_instructions", "resume_session"])]
+    #[arg(
+        long,
+        value_name = "PATH",
+        requires = "workspace",
+        conflicts_with = "resume_session"
+    )]
     pub(crate) instructions: Option<PathBuf>,
-    #[arg(long, conflicts_with = "resume_session")]
-    pub(crate) no_project_instructions: bool,
-    #[arg(long, value_name = "PATH", conflicts_with = "resume_session")]
-    pub(crate) save_session: Option<PathBuf>,
     #[arg(long, value_name = "PATH")]
     pub(crate) resume_session: Option<PathBuf>,
-    #[arg(value_name = "MESSAGE")]
-    pub(crate) message: Option<OsString>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -30,14 +28,6 @@ pub(crate) enum StdinEvent {
     Blank,
     Exit,
     Eof,
-}
-
-pub(crate) fn validate_message(message: OsString) -> Result<String, String> {
-    let message = message
-        .into_string()
-        .map_err(|_| "user message must be valid Unicode")?;
-    validate_text(&message)?;
-    Ok(message)
 }
 
 pub(crate) fn validate_text(message: &str) -> Result<(), String> {
@@ -84,27 +74,8 @@ mod tests {
     use std::io::Cursor;
 
     #[test]
-    fn parses_interactive_and_one_shot_shapes() {
-        let parsed = Cli::try_parse_from(["program"]).unwrap();
-        assert!(parsed.message.is_none());
-        assert!(parsed.workspace.is_none());
-
-        let parsed = Cli::try_parse_from([
-            "program",
-            "--workspace",
-            "example",
-            "one message with spaces",
-        ])
-        .unwrap();
-        assert_eq!(parsed.workspace, Some(PathBuf::from("example")));
-        assert_eq!(parsed.message, Some("one message with spaces".into()));
-
-        assert!(Cli::try_parse_from(["program", "one", "two"]).is_err());
-    }
-
-    #[test]
-    fn instruction_and_session_flags_enforce_requirements_and_conflicts() {
-        assert!(Cli::try_parse_from(["program", "--instructions", "instructions.txt"]).is_err());
+    fn parses_stdin_options_and_rejects_removed_modes() {
+        assert!(Cli::try_parse_from(["program"]).is_ok());
         let parsed = Cli::try_parse_from([
             "program",
             "--workspace",
@@ -114,50 +85,23 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(parsed.instructions, Some(PathBuf::from("instructions.txt")));
+        assert!(Cli::try_parse_from(["program", "--resume-session", "session.json"]).is_ok());
         for args in [
-            vec![
-                "--save-session",
-                "new.json",
-                "--resume-session",
-                "saved.json",
-            ],
-            vec![
-                "--resume-session",
-                "saved.json",
-                "--no-project-instructions",
-            ],
-            vec![
-                "--resume-session",
-                "saved.json",
-                "--workspace",
-                ".",
-                "--instructions",
-                "AGENTS.md",
-            ],
+            vec!["Hello"],
+            vec!["--save-session", "session.json"],
+            vec!["--no-project-instructions"],
+            vec!["--instructions", "instructions.txt"],
             vec![
                 "--workspace",
                 ".",
                 "--instructions",
                 "AGENTS.md",
-                "--no-project-instructions",
+                "--resume-session",
+                "session.json",
             ],
         ] {
             assert!(Cli::try_parse_from(std::iter::once("program").chain(args)).is_err());
         }
-    }
-
-    #[test]
-    fn validates_one_shot_message_without_changing_whitespace() {
-        let text = "  meaningful text  ";
-        assert_eq!(validate_message(text.into()).unwrap(), text);
-        for message in [
-            " ".into(),
-            "\n".into(),
-            "x".repeat(MAX_MESSAGE_BYTES + 1).into(),
-        ] {
-            assert!(validate_message(message).is_err());
-        }
-        assert!(validate_message("x".repeat(MAX_MESSAGE_BYTES).into()).is_ok());
     }
 
     #[test]
@@ -190,12 +134,5 @@ mod tests {
         ));
         let mut oversized = Cursor::new(format!("{}\n", "x".repeat(MAX_MESSAGE_BYTES + 1)));
         assert!(read_stdin_event(&mut oversized).is_err());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn rejects_non_unicode_one_shot_message() {
-        use std::os::unix::ffi::OsStringExt;
-        assert!(validate_message(OsString::from_vec(vec![0xff])).is_err());
     }
 }

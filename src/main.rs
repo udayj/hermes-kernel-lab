@@ -43,18 +43,6 @@ fn api_key() -> Result<String, String> {
     }
 }
 
-fn run_once(
-    message: String,
-    tools: ToolCatalog,
-    session: Session,
-    checkpoint: Option<Checkpoint>,
-) -> Result<(), String> {
-    let key = api_key()?;
-    let mut agent = Agent::new(key, tools, session, checkpoint)?;
-    let mut output = std::io::stdout().lock();
-    agent.run_turn(message, &mut output)
-}
-
 fn run_stdin(
     tools: ToolCatalog,
     session: Session,
@@ -82,12 +70,32 @@ fn run_stdin(
                     let key = api_key()?;
                     let (tools, session, checkpoint) =
                         startup.take().expect("agent is initialized only once");
+                    let checkpoint = match checkpoint {
+                        Some(checkpoint) => checkpoint,
+                        None => {
+                            let home = env::var_os("HOME")
+                                .filter(|home| !home.is_empty())
+                                .ok_or("HOME must be set for automatic session saving")?;
+                            Checkpoint::automatic(std::path::Path::new(&home))?
+                        }
+                    };
                     agent = Some(Agent::new(key, tools, session, checkpoint)?);
                 }
-                agent
+                if let Some(path) = agent
                     .as_mut()
                     .expect("agent was initialized")
-                    .run_turn(message, &mut output)?;
+                    .run_turn(message, &mut output)?
+                {
+                    writeln!(
+                        error_output,
+                        "Resume this session with --resume-session {}",
+                        path.display()
+                    )
+                    .and_then(|()| error_output.flush())
+                    .map_err(
+                        |_| "checkpoint saved, but could not print its resume path to stderr",
+                    )?;
+                }
             }
         }
     }
@@ -96,11 +104,8 @@ fn run_stdin(
 fn load_instructions(
     tools: &ToolCatalog,
     path: Option<&std::path::Path>,
-    no_project_instructions: bool,
 ) -> Result<String, String> {
-    let operator = if no_project_instructions {
-        None
-    } else if let Some(path) = path {
+    let operator = if let Some(path) = path {
         Some(tools.read_instructions(path)?)
     } else {
         tools.default_instructions()?
@@ -110,28 +115,15 @@ fn load_instructions(
 
 fn run() -> Result<(), String> {
     let cli = Cli::parse();
-    let message = cli.message.map(cli::validate_message).transpose()?;
     let tools = ToolCatalog::open(cli.workspace.as_deref())?;
     let (session, checkpoint) = if let Some(path) = cli.resume_session {
         let checkpoint = Checkpoint::open(&path, true)?;
         (checkpoint.load()?, Some(checkpoint))
     } else {
-        let system = load_instructions(
-            &tools,
-            cli.instructions.as_deref(),
-            cli.no_project_instructions,
-        )?;
-        let checkpoint = cli
-            .save_session
-            .as_deref()
-            .map(|path| Checkpoint::open(path, false))
-            .transpose()?;
-        (Session::new(system), checkpoint)
+        let system = load_instructions(&tools, cli.instructions.as_deref())?;
+        (Session::new(system), None)
     };
-    match message {
-        Some(message) => run_once(message, tools, session, checkpoint),
-        None => run_stdin(tools, session, checkpoint),
-    }
+    run_stdin(tools, session, checkpoint)
 }
 
 fn main() -> ExitCode {
@@ -154,22 +146,17 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let tools = ToolCatalog::open(Some(directory.path())).unwrap();
         assert_eq!(
-            load_instructions(&tools, None, false).unwrap(),
+            load_instructions(&tools, None).unwrap(),
             compose_instructions(None)
         );
         fs::write(directory.path().join("AGENTS.md"), "root default").unwrap();
         assert_eq!(
-            load_instructions(&tools, None, false).unwrap(),
+            load_instructions(&tools, None).unwrap(),
             compose_instructions(Some("root default"))
-        );
-        assert_eq!(
-            load_instructions(&tools, None, true).unwrap(),
-            compose_instructions(None)
         );
         for text in ["", "  synthetic operator text\n世界\n  "] {
             fs::write(directory.path().join("instructions.txt"), text).unwrap();
-            let system =
-                load_instructions(&tools, Some(Path::new("instructions.txt")), false).unwrap();
+            let system = load_instructions(&tools, Some(Path::new("instructions.txt"))).unwrap();
             assert_eq!(
                 system,
                 format!(
@@ -180,24 +167,23 @@ mod tests {
         }
         let disabled = ToolCatalog::without_workspace();
         assert_eq!(
-            load_instructions(&disabled, None, false).unwrap(),
+            load_instructions(&disabled, None).unwrap(),
             compose_instructions(None)
         );
-        assert!(load_instructions(&disabled, Some(Path::new("instructions.txt")), false).is_err());
+        assert!(load_instructions(&disabled, Some(Path::new("instructions.txt"))).is_err());
         let default = directory.path().join("AGENTS.md");
         for bytes in [vec![0xff], vec![b'x'; 32 * 1024 + 1]] {
             fs::write(&default, bytes).unwrap();
-            assert!(load_instructions(&tools, None, false).is_err());
-            assert!(load_instructions(&tools, None, true).is_ok());
+            assert!(load_instructions(&tools, None).is_err());
         }
         fs::remove_file(&default).unwrap();
         fs::create_dir(&default).unwrap();
-        assert!(load_instructions(&tools, None, false).is_err());
+        assert!(load_instructions(&tools, None).is_err());
         fs::remove_dir(&default).unwrap();
         #[cfg(unix)]
         {
             std::os::unix::fs::symlink("missing", &default).unwrap();
-            assert!(load_instructions(&tools, None, false).is_err());
+            assert!(load_instructions(&tools, None).is_err());
         }
     }
 
@@ -209,7 +195,7 @@ mod tests {
         fs::write(directory.path().join("invalid.bin"), [0xff]).unwrap();
         // Exhaustive filesystem restrictions belong to workspace tests.
         for path in ["missing", "invalid.bin", "../outside"] {
-            assert!(load_instructions(&tools, Some(Path::new(path)), false).is_err());
+            assert!(load_instructions(&tools, Some(Path::new(path))).is_err());
         }
     }
 
