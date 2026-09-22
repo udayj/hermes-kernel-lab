@@ -49,7 +49,7 @@ impl Session {
             } else if expect_user {
                 match (message.role.as_str(), message.content.as_slice()) {
                     ("user", [ContentBlock::Text { text }]) => {
-                        crate::cli::validate_message(text.clone().into())?;
+                        crate::cli::validate_text(text)?;
                     }
                     _ => return Err("checkpoint expected a user text message".into()),
                 }

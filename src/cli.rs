@@ -36,17 +36,18 @@ pub(crate) fn validate_message(message: OsString) -> Result<String, String> {
     let message = message
         .into_string()
         .map_err(|_| "user message must be valid Unicode")?;
-    validate_text(message)
+    validate_text(&message)?;
+    Ok(message)
 }
 
-fn validate_text(message: String) -> Result<String, String> {
+pub(crate) fn validate_text(message: &str) -> Result<(), String> {
     if message.trim().is_empty() {
         return Err("user message must not be blank".into());
     }
     if message.len() > MAX_MESSAGE_BYTES {
         return Err("user message exceeds the 16 KiB limit".into());
     }
-    Ok(message)
+    Ok(())
 }
 
 pub(crate) fn read_stdin_event(reader: &mut impl BufRead) -> Result<StdinEvent, String> {
@@ -102,7 +103,7 @@ mod tests {
     }
 
     #[test]
-    fn instructions_require_an_explicit_workspace() {
+    fn instruction_and_session_flags_enforce_requirements_and_conflicts() {
         assert!(Cli::try_parse_from(["program", "--instructions", "instructions.txt"]).is_err());
         let parsed = Cli::try_parse_from([
             "program",
@@ -113,6 +114,36 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(parsed.instructions, Some(PathBuf::from("instructions.txt")));
+        for args in [
+            vec![
+                "--save-session",
+                "new.json",
+                "--resume-session",
+                "saved.json",
+            ],
+            vec![
+                "--resume-session",
+                "saved.json",
+                "--no-project-instructions",
+            ],
+            vec![
+                "--resume-session",
+                "saved.json",
+                "--workspace",
+                ".",
+                "--instructions",
+                "AGENTS.md",
+            ],
+            vec![
+                "--workspace",
+                ".",
+                "--instructions",
+                "AGENTS.md",
+                "--no-project-instructions",
+            ],
+        ] {
+            assert!(Cli::try_parse_from(std::iter::once("program").chain(args)).is_err());
+        }
     }
 
     #[test]

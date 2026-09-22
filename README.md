@@ -251,9 +251,10 @@ The checkpoint scenario saves and reconstructs a session before its next scripte
 request, checking ordered tool results/errors, saved instructions, fresh workspace
 authority, and a reset budget. Focused failure tests cover malformed/incomplete
 checkpoints, destination refusal, byte limits, private Unix permissions, and
-preservation of the previous checkpoint. A subprocess check exercises CLI flag
-conflicts, validation before credentials, and no-turn exits in the real binary. Run just
-these tests with `cargo test agent::tests::scripted_`.
+preservation of the previous checkpoint. Parser tests cover CLI flag conflicts;
+a subprocess check covers validation before credentials, ignored instruction files
+on resume, and no-turn exits in the real binary. Run the scripted orchestration
+tests with `cargo test agent::tests::scripted_`.
 The synthetic responses bypass HTTP and response decoding; they do not verify
 the integration between those layers and the loop. Filesystem-specific checks
 run on the current Unix development host. Live-provider behavior, HTTP-driven

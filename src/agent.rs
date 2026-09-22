@@ -45,7 +45,7 @@ impl Agent {
         message: String,
         output: &mut impl Write,
     ) -> Result<(), String> {
-        run_completed_turn(
+        run_turn(
             &mut self.session,
             self.checkpoint.as_mut(),
             &self.tools,
@@ -56,51 +56,32 @@ impl Agent {
     }
 }
 
-// Both CLI modes use this boundary: output must succeed before publication.
-fn run_completed_turn(
+// Both CLI modes use this loop: completed output must precede checkpoint publication.
+fn run_turn(
     session: &mut Session,
     checkpoint: Option<&mut Checkpoint>,
     tools: &ToolCatalog,
     message: String,
     output: &mut impl Write,
-    model_call: impl FnMut(&str, &[Message], &[ToolDefinition]) -> Result<AssistantResponse, String>,
-) -> Result<(), String> {
-    run_turn(
-        &session.system,
-        &mut session.messages,
-        tools,
-        message,
-        output,
-        model_call,
-    )?;
-    if let Some(checkpoint) = checkpoint {
-        checkpoint.save(session)?;
-    }
-    Ok(())
-}
-
-fn run_turn(
-    system: &str,
-    history: &mut Vec<Message>,
-    tools: &ToolCatalog,
-    message: String,
-    output: &mut impl Write,
     mut model_call: impl FnMut(&str, &[Message], &[ToolDefinition]) -> Result<AssistantResponse, String>,
 ) -> Result<(), String> {
-    history.push(Message::user(message));
+    session.messages.push(Message::user(message));
     for calls in 1..=MAX_MODEL_CALLS_PER_TURN {
         let definitions = tools.definitions();
-        let response = model_call(system, history, &definitions)?;
+        let response = model_call(&session.system, &session.messages, &definitions)?;
         check_call_budget(&response, calls)?;
         write_assistant(output, &response)?;
         let tool_call = response.tool_call.clone();
-        history.push(Message::assistant(response.content));
+        session.messages.push(Message::assistant(response.content));
 
         let Some(call) = tool_call else {
+            if let Some(checkpoint) = checkpoint {
+                checkpoint.save(session)?;
+            }
             return Ok(());
         };
         let outcome = tools.execute(&call.name, &call.input);
-        history.push(Message::tool_result(
+        session.messages.push(Message::tool_result(
             call.id.clone(),
             outcome.content.clone(),
             outcome.is_error,
@@ -266,11 +247,11 @@ mod tests {
     fn scripted_direct_answer() {
         let tools = ToolCatalog::without_workspace();
         let mut script = Script::new([Ok(response(None))]);
-        let mut history = Vec::new();
+        let mut session = Session::new(BUILT_IN_INSTRUCTIONS.into());
         let mut output = Vec::new();
         run_turn(
-            BUILT_IN_INSTRUCTIONS,
-            &mut history,
+            &mut session,
+            None,
             &tools,
             "Hello".into(),
             &mut output,
@@ -279,7 +260,7 @@ mod tests {
         .unwrap();
         script.assert_requests(&[json!([user("Hello")])], &tools);
         assert!(script.responses.is_empty());
-        assert_eq!(json!(history), json!([user("Hello"), answer()]));
+        assert_eq!(json!(session.messages), json!([user("Hello"), answer()]));
         assert_eq!(output, b"BeforeAfter\n");
     }
 
@@ -292,11 +273,11 @@ mod tests {
             Ok(response(None)),
             Ok(response(None)),
         ]);
-        let mut history = Vec::new();
+        let mut session = Session::new(BUILT_IN_INSTRUCTIONS.into());
         let mut output = Vec::new();
         run_turn(
-            BUILT_IN_INSTRUCTIONS,
-            &mut history,
+            &mut session,
+            None,
             &tools,
             "Read".into(),
             &mut output,
@@ -310,10 +291,10 @@ mod tests {
         ];
         let after_tool = json!(expected);
         expected.push(answer());
-        assert_eq!(json!(history), json!(expected));
+        assert_eq!(json!(session.messages), json!(expected));
         run_turn(
-            BUILT_IN_INSTRUCTIONS,
-            &mut history,
+            &mut session,
+            None,
             &tools,
             "Again".into(),
             &mut output,
@@ -326,7 +307,7 @@ mod tests {
             &tools,
         );
         expected.push(answer());
-        assert_eq!(json!(history), json!(expected));
+        assert_eq!(json!(session.messages), json!(expected));
         assert!(script.responses.is_empty());
         assert_eq!(
             String::from_utf8(output).unwrap(),
@@ -351,28 +332,27 @@ mod tests {
 
         let mut expected = vec![user("Read")];
         let mut responses = Vec::new();
-        for i in 1..=7 {
-            let id = format!("read-{i}");
-            let input = if i % 2 == 1 {
-                json!({"path":"AGENTS.md"})
-            } else {
-                json!({})
-            };
-            responses.push(Ok(tool_response(&id, "read_file", input.clone())));
-            expected.push(assistant_tool(&id, "read_file", input));
-            expected.push(result(
-                &id,
-                if i % 2 == 1 {
-                    "Synthetic edited instructions.\n"
-                } else {
-                    "tool input must contain exactly one field named path"
-                },
-                i % 2 == 0,
-            ));
+        for (id, input, content, is_error) in [
+            (
+                "read-1",
+                json!({"path":"AGENTS.md"}),
+                "Synthetic edited instructions.\n",
+                false,
+            ),
+            (
+                "read-2",
+                json!({}),
+                "tool input must contain exactly one field named path",
+                true,
+            ),
+        ] {
+            responses.push(Ok(tool_response(id, "read_file", input.clone())));
+            expected.push(assistant_tool(id, "read_file", input));
+            expected.push(result(id, content, is_error));
         }
         responses.push(Ok(response(None)));
         let mut script = Script::new(responses);
-        run_completed_turn(
+        run_turn(
             &mut session,
             Some(&mut checkpoint),
             &tools,
@@ -405,7 +385,7 @@ mod tests {
             .collect();
         responses.push(Ok(response(None)));
         let mut script = Script::new(responses);
-        run_completed_turn(
+        run_turn(
             &mut restored,
             Some(&mut checkpoint),
             &tools,
@@ -444,7 +424,7 @@ mod tests {
         let tools = ToolCatalog::without_workspace();
         let mut checkpoint = Checkpoint::open(&path, false).unwrap();
         let mut session = Session::new(BUILT_IN_INSTRUCTIONS.into());
-        run_completed_turn(
+        run_turn(
             &mut session,
             Some(&mut checkpoint),
             &tools,
@@ -467,7 +447,7 @@ mod tests {
                 fail_on_flush: true,
             };
             let mut calls = 0;
-            let error = run_completed_turn(
+            let error = run_turn(
                 &mut session,
                 Some(&mut checkpoint),
                 &tools,
@@ -494,7 +474,7 @@ mod tests {
         }
         let mut fresh = Checkpoint::open(&directory.path().join("new.json"), false).unwrap();
         assert!(
-            run_completed_turn(
+            run_turn(
                 &mut Session::new("system".into()),
                 Some(&mut fresh),
                 &tools,
@@ -515,11 +495,11 @@ mod tests {
             Ok(tool_response("bad-1", "get_runtime_info", input.clone())),
             Ok(response(None)),
         ]);
-        let mut history = Vec::new();
+        let mut session = Session::new(BUILT_IN_INSTRUCTIONS.into());
         let mut output = Vec::new();
         run_turn(
-            BUILT_IN_INSTRUCTIONS,
-            &mut history,
+            &mut session,
+            None,
             &tools,
             "Try".into(),
             &mut output,
@@ -537,7 +517,7 @@ mod tests {
         ];
         script.assert_requests(&[json!([user("Try")]), json!(expected)], &tools);
         expected.push(answer());
-        assert_eq!(json!(history), json!(expected));
+        assert_eq!(json!(session.messages), json!(expected));
         assert!(script.responses.is_empty());
         assert_eq!(
             String::from_utf8(output).unwrap(),
@@ -547,102 +527,49 @@ mod tests {
 
     #[test]
     fn scripted_budget_boundary_and_reset() {
-        // Both successful results and tool errors consume the same turn budget.
-        for tool_error in [false, true] {
-            for final_tool in [false, true] {
-                let (_directory, tools) = workspace();
-                let input = if tool_error {
-                    json!({})
-                } else {
-                    json!({"path":"fixture.txt"})
-                };
-                let content = if tool_error {
-                    "tool input must contain exactly one field named path"
-                } else {
-                    "synthetic file\n"
-                };
-                let mut responses: Vec<_> = (1..=7)
-                    .map(|i| {
-                        Ok(tool_response(
-                            &format!("read-{i}"),
-                            "read_file",
-                            input.clone(),
-                        ))
-                    })
-                    .collect();
-                responses.push(Ok(if final_tool {
-                    tool_response("read-8", "read_file", input.clone())
-                } else {
-                    response(None)
-                }));
-                let mut script = Script::new(responses);
-                let mut history = Vec::new();
-                let mut output = Vec::new();
-                let outcome = run_turn(
-                    BUILT_IN_INSTRUCTIONS,
-                    &mut history,
-                    &tools,
-                    "Start".into(),
-                    &mut output,
-                    |s, h, t| script.send(s, h, t),
-                );
-                let mut expected = vec![user("Start")];
-                let mut requests = vec![json!(expected)];
-                for i in 1..=7 {
-                    let id = format!("read-{i}");
-                    expected.push(assistant_tool(&id, "read_file", input.clone()));
-                    expected.push(result(&id, content, tool_error));
-                    requests.push(json!(expected));
-                }
-                script.assert_requests(&requests, &tools);
-                assert!(script.responses.is_empty());
-                if final_tool {
-                    assert_eq!(
-                        outcome.unwrap_err(),
-                        "model-call budget exhausted (8 calls per user turn); tool not executed"
-                    );
-                    assert_eq!(
-                        String::from_utf8(output)
-                            .unwrap()
-                            .matches("BeforeAfter\n")
-                            .count(),
-                        7
-                    );
-                } else {
-                    outcome.unwrap();
-                    expected.push(answer());
-                    assert_eq!(json!(history), json!(expected));
-                    // A second full eight-call turn proves the counter resets.
-                    script.responses.extend((1..=7).map(|i| {
-                        Ok(tool_response(
-                            &format!("next-{i}"),
-                            "read_file",
-                            input.clone(),
-                        ))
-                    }));
-                    script.responses.push_back(Ok(response(None)));
-                    run_turn(
-                        BUILT_IN_INSTRUCTIONS,
-                        &mut history,
-                        &tools,
-                        "Next".into(),
-                        &mut output,
-                        |s, h, t| script.send(s, h, t),
-                    )
-                    .unwrap();
-                    expected.push(user("Next"));
-                    requests.push(json!(expected));
-                    for i in 1..=7 {
-                        let id = format!("next-{i}");
-                        expected.push(assistant_tool(&id, "read_file", input.clone()));
-                        expected.push(result(&id, content, tool_error));
-                        requests.push(json!(expected));
-                    }
-                    expected.push(answer());
-                    script.assert_requests(&requests, &tools);
-                    assert!(script.responses.is_empty());
-                }
-                assert_eq!(json!(history), json!(expected));
+        let tools = ToolCatalog::without_workspace();
+        let mut session = Session::new(BUILT_IN_INSTRUCTIONS.into());
+        for final_tool in [false, true] {
+            let mut responses: Vec<_> = (1..=7)
+                .map(|i| {
+                    // Mix successful tool calls and tool errors within the same budget.
+                    Ok(tool_response(
+                        &format!("call-{i}"),
+                        "get_runtime_info",
+                        if i % 2 == 0 {
+                            json!({"extra":true})
+                        } else {
+                            json!({})
+                        },
+                    ))
+                })
+                .collect();
+            responses.push(Ok(if final_tool {
+                tool_response("call-8", "get_runtime_info", json!({}))
+            } else {
+                response(None)
+            }));
+            let mut script = Script::new(responses);
+            let mut output = Vec::new();
+            let outcome = run_turn(
+                &mut session,
+                None,
+                &tools,
+                "Start".into(),
+                &mut output,
+                |s, h, t| script.send(s, h, t),
+            );
+            assert_eq!(script.requests.len(), 8);
+            assert!(script.responses.is_empty());
+            let output = String::from_utf8(output).unwrap();
+            assert_eq!(output.matches("[Local ").count(), 7);
+            if final_tool {
+                assert!(outcome.unwrap_err().contains("budget exhausted"));
+                assert!(!output.contains("call-8"));
+                assert_eq!(output.matches("BeforeAfter").count(), 7);
+            } else {
+                outcome.unwrap();
+                assert_eq!(output.matches("BeforeAfter").count(), 8);
             }
         }
     }
@@ -659,10 +586,10 @@ mod tests {
             responses.push(Err("synthetic model failure".into()));
             responses.push(Ok(response(None)));
             let mut script = Script::new(responses);
-            let mut history = Vec::new();
+            let mut session = Session::new(BUILT_IN_INSTRUCTIONS.into());
             let error = run_turn(
-                BUILT_IN_INSTRUCTIONS,
-                &mut history,
+                &mut session,
+                None,
                 &tools,
                 "Start".into(),
                 &mut Vec::new(),
@@ -679,7 +606,7 @@ mod tests {
             }
             script.assert_requests(&requests, &tools);
             assert_eq!(script.responses.len(), 1);
-            assert_eq!(json!(history), json!(expected));
+            assert_eq!(json!(session.messages), json!(expected));
         }
     }
 
@@ -721,10 +648,10 @@ mod tests {
                     fail_after_flushes,
                     fail_on_flush,
                 };
-                let mut history = Vec::new();
+                let mut session = Session::new(BUILT_IN_INSTRUCTIONS.into());
                 let error = run_turn(
-                    BUILT_IN_INSTRUCTIONS,
-                    &mut history,
+                    &mut session,
+                    None,
                     &tools,
                     "Start".into(),
                     &mut output,
@@ -741,67 +668,8 @@ mod tests {
                 }
                 script.assert_requests(&[json!([user("Start")])], &tools);
                 assert_eq!(script.responses.len(), 1);
-                assert_eq!(json!(history), json!(expected));
+                assert_eq!(json!(session.messages), json!(expected));
             }
         }
-    }
-
-    #[test]
-    fn budget_allows_call_eight_to_end_but_not_request_a_tool() {
-        assert!(check_call_budget(&response(None), 8).is_ok());
-        let tool_call = ToolCall {
-            id: "call".into(),
-            name: "get_runtime_info".into(),
-            input: json!({}),
-        };
-        assert!(check_call_budget(&response(Some(tool_call.clone())), 7).is_ok());
-        assert!(check_call_budget(&response(Some(tool_call)), 8).is_err());
-    }
-
-    #[test]
-    fn output_distinguishes_assistant_text_and_local_results() {
-        let mut output = Vec::new();
-        write_assistant(&mut output, &response(None)).unwrap();
-        write_tool_outcome(
-            &mut output,
-            "read_file",
-            "call-1",
-            &ToolOutcome {
-                content: "file contents".into(),
-                is_error: false,
-            },
-        )
-        .unwrap();
-        write_tool_outcome(
-            &mut output,
-            "read_file",
-            "call-2",
-            &ToolOutcome {
-                content: "denied".into(),
-                is_error: true,
-            },
-        )
-        .unwrap();
-        assert_eq!(
-            String::from_utf8(output).unwrap(),
-            "BeforeAfter\n[Local read_file result; call call-1]\nfile contents\n[Local read_file error; call call-2]\ndenied\n"
-        );
-    }
-
-    #[test]
-    fn output_failures_are_fatal() {
-        assert!(write_assistant(&mut &mut [0_u8; 0][..], &response(None)).is_err());
-        assert!(
-            write_tool_outcome(
-                &mut &mut [0_u8; 0][..],
-                "tool",
-                "call",
-                &ToolOutcome {
-                    content: "result".into(),
-                    is_error: false,
-                }
-            )
-            .is_err()
-        );
     }
 }

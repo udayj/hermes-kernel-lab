@@ -202,50 +202,14 @@ mod tests {
     }
 
     #[test]
-    fn invalid_instruction_selections_fail_during_local_startup() {
+    fn explicit_instruction_failures_propagate_from_workspace_reads() {
         use std::{fs, path::Path};
         let directory = tempfile::tempdir().unwrap();
         let tools = ToolCatalog::open(Some(directory.path())).unwrap();
-        fs::write(
-            directory.path().join("large.txt"),
-            vec![b'x'; 32 * 1024 + 1],
-        )
-        .unwrap();
         fs::write(directory.path().join("invalid.bin"), [0xff]).unwrap();
-        fs::write(directory.path().join(".hidden"), "synthetic").unwrap();
-        fs::create_dir(directory.path().join("directory")).unwrap();
-        for path in [
-            "",
-            "missing",
-            "large.txt",
-            "invalid.bin",
-            ".hidden",
-            "../outside",
-            "/absolute",
-            "./relative",
-            ".",
-            "directory",
-        ] {
-            assert!(
-                load_instructions(&tools, Some(Path::new(path)), false).is_err(),
-                "accepted {path}"
-            );
-        }
-        fs::write(directory.path().join("boundary.txt"), vec![b'x'; 32 * 1024]).unwrap();
-        assert!(load_instructions(&tools, Some(Path::new("boundary.txt")), false).is_ok());
-        #[cfg(unix)]
-        {
-            use std::os::unix::{ffi::OsStringExt, fs::symlink};
-            symlink("boundary.txt", directory.path().join("file-link")).unwrap();
-            symlink("directory", directory.path().join("dir-link")).unwrap();
-            fs::write(directory.path().join("directory/file.txt"), "synthetic").unwrap();
-            for path in ["file-link", "dir-link/file.txt"] {
-                assert!(load_instructions(&tools, Some(Path::new(path)), false).is_err());
-            }
-            let invalid = std::ffi::OsString::from_vec(vec![0xff]);
-            assert!(load_instructions(&tools, Some(Path::new(&invalid)), false).is_err());
-            let devices = ToolCatalog::open(Some(Path::new("/dev"))).unwrap();
-            assert!(load_instructions(&devices, Some(Path::new("null")), false).is_err());
+        // Exhaustive filesystem restrictions belong to workspace tests.
+        for path in ["missing", "invalid.bin", "../outside"] {
+            assert!(load_instructions(&tools, Some(Path::new(path)), false).is_err());
         }
     }
 

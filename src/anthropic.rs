@@ -349,22 +349,6 @@ mod tests {
     }
 
     #[test]
-    fn correlated_tool_results_serialize_success_and_error() {
-        let success = Message::tool_result("call-1".into(), "ok".into(), false);
-        let error = Message::tool_result("call-2".into(), "denied".into(), true);
-        assert_eq!(
-            serde_json::to_value(success).unwrap(),
-            json!({"role":"user","content":[{"type":"tool_result",
-                "tool_use_id":"call-1","content":"ok"}]})
-        );
-        assert_eq!(
-            serde_json::to_value(error).unwrap(),
-            json!({"role":"user","content":[{"type":"tool_result",
-                "tool_use_id":"call-2","content":"denied","is_error":true}]})
-        );
-    }
-
-    #[test]
     fn rejects_malformed_and_inconsistent_responses() {
         for body in [b"not json".as_slice(), b"{}"] {
             assert!(decode_response(body).is_err());

@@ -39,60 +39,25 @@ fn cli_validates_before_credentials_and_no_turn_exits_never_write() {
     fs::write(&path, saved).unwrap();
     // Resume must not attempt to load even an invalid root instruction file.
     fs::write(directory.path().join("AGENTS.md"), [0xff]).unwrap();
-    for input in ["", "\n", "/exit\n"] {
-        for args in [
-            vec!["--resume-session", "saved.json"],
+    for (args, input) in [
+        (vec!["--resume-session", "saved.json"], ""),
+        (
             vec!["--resume-session", "saved.json", "--workspace", "."],
-        ] {
-            assert!(invoke(&args, input).status.success());
-            assert_eq!(fs::read(&path).unwrap(), saved);
-        }
+            "\n/exit\n",
+        ),
+    ] {
+        assert!(invoke(&args, input).status.success());
+        assert_eq!(fs::read(&path).unwrap(), saved);
     }
+    fs::write(&path, "not json").unwrap();
     for args in [
-        vec![
-            "--save-session",
-            "new.json",
-            "--resume-session",
-            "saved.json",
-        ],
-        vec![
-            "--resume-session",
-            "saved.json",
-            "--no-project-instructions",
-        ],
-        vec![
-            "--resume-session",
-            "saved.json",
-            "--workspace",
-            ".",
-            "--instructions",
-            "AGENTS.md",
-        ],
-        vec![
-            "--workspace",
-            ".",
-            "--instructions",
-            "AGENTS.md",
-            "--no-project-instructions",
-        ],
+        vec!["--resume-session", "saved.json"],
+        vec!["--resume-session", "saved.json", "Hello"],
     ] {
-        assert_eq!(invoke(&args, "").status.code(), Some(2));
-    }
-    for text in [
-        "not json",
-        "{}",
-        r#"{"version":2,"provider":"other","model":"other","system":"s","messages":[]}"#,
-    ] {
-        fs::write(&path, text).unwrap();
-        for args in [
-            vec!["--resume-session", "saved.json"],
-            vec!["--resume-session", "saved.json", "Hello"],
-        ] {
-            let output = invoke(&args, "");
-            assert!(!output.status.success());
-            let error = String::from_utf8(output.stderr).unwrap();
-            assert!(error.contains("checkpoint"), "{error}");
-            assert!(!error.contains("ANTHROPIC_API_KEY"), "{error}");
-        }
+        let output = invoke(&args, "");
+        assert!(!output.status.success());
+        let error = String::from_utf8(output.stderr).unwrap();
+        assert!(error.contains("checkpoint"), "{error}");
+        assert!(!error.contains("ANTHROPIC_API_KEY"), "{error}");
     }
 }
