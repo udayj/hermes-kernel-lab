@@ -1,5 +1,11 @@
 # Hermes, Oxidized
 
+A learning project exploring agent runtimes by growing a small Rust program.
+Hermes is both a capability reference and a low-fidelity design and
+implementation reference: this project reconstructs selected mechanisms in a
+smaller form without aiming for feature parity or translating its architecture
+directly.
+
 A small Rust agent CLI using Anthropic’s Claude Haiku 4.5
 (`claude-haiku-4-5-20251001`), with read-only workspace tools and automatic
 conversation saving.
