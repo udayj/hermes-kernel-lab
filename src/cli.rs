@@ -14,6 +14,9 @@ pub struct Cli {
     /// Enable read-only procedures from one trusted local directory.
     #[arg(long, value_name = "PATH")]
     pub skills_dir: Option<PathBuf>,
+    /// Enable persistent facts in one existing trusted directory.
+    #[arg(long, value_name = "PATH")]
+    pub memory_dir: Option<PathBuf>,
     #[arg(
         long,
         value_name = "PATH",

@@ -39,6 +39,23 @@ fn cli_validates_before_credentials_and_no_turn_exits_never_write() {
         {"role":"user","content":[{"type":"text","text":"hello"}]},
         {"role":"assistant","content":[{"type":"text","text":"answer"}]}]}"#;
     write(&path, saved).unwrap();
+    create_dir_all(directory.path().join("memory")).unwrap();
+    for input in ["", "\n", "/exit\n"] {
+        assert!(invoke(&["--memory-dir", "memory"], input).status.success());
+        assert!(!directory.path().join("memory/memory.json").exists());
+    }
+    write(directory.path().join("memory/memory.json"), "invalid").unwrap();
+    for args in [
+        vec!["--memory-dir", "memory"],
+        vec!["--resume-session", "saved.json", "--memory-dir", "memory"],
+    ] {
+        let output = invoke(&args, "Hello\n");
+        assert!(!output.status.success());
+        let error = String::from_utf8(output.stderr).unwrap();
+        assert!(error.contains("memory"), "{error}");
+        assert!(!error.contains("ANTHROPIC_API_KEY"), "{error}");
+        assert_eq!(read(&path).unwrap(), saved);
+    }
     // Resume must not attempt to load even an invalid root instruction file.
     write(directory.path().join("AGENTS.md"), [0xff]).unwrap();
     create_dir_all(directory.path().join("skills/sample")).unwrap();

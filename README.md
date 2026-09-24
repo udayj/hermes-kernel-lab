@@ -8,7 +8,7 @@ directly.
 
 A small Rust agent CLI using Anthropic’s Claude Haiku 4.5
 (`claude-haiku-4-5-20251001`), with read-only workspace tools, opt-in local skills,
-and automatic conversation saving.
+opt-in cross-session memory, and automatic conversation saving.
 
 ## Run
 
@@ -35,7 +35,7 @@ Output goes to stdout; prompts, the resume path, and errors go to stderr.
 Paths must be workspace-relative; absolute paths, parent traversal, hidden path
 components, and symlink traversal are rejected. Files must be regular UTF-8 text.
 `get_runtime_info` is always available and reports target OS, architecture, and
-available parallelism. There are no write or shell tools.
+available parallelism. Workspace and skill tools are read-only. Only the opt-in memory tools can write; there are no shell tools.
 
 Fresh sessions use built-in system instructions plus one optional file:
 
@@ -119,6 +119,61 @@ on disk, and request it again. Then resume with `--skills-dir` and request it on
 more. Explain why the first process returns its original snapshot, while the new
 process can return changed content alongside the unchanged historical result.
 
+## Cross-session memory
+
+`--memory-dir PATH` authorizes reading and writing one fixed `memory.json` in an
+existing trusted directory, independently of workspace and skills access. Without
+this flag, memory tools are disabled. Model arguments select text keys, never paths.
+The versioned JSON store has the shape `{"version":1,"entries":{"label":"amber"}}`.
+
+`memory_list({})` returns the entries as a key-sorted JSON object.
+`memory_set({"key":"label","value":"amber"})` inserts or replaces one fact;
+`memory_delete({"key":"label"})` removes it. Deleting an absent key or setting the
+same value is a successful no-op. Limits are 32 entries, nonblank keys up to 64
+UTF-8 bytes, nonblank values up to 1,024 bytes, and 32 KiB for the complete
+serialized file, including JSON escaping. Accepted whitespace is preserved.
+
+Startup loads and validates memory once, before credentials or model requests.
+Missing memory means empty memory; malformed, unreadable, oversized, symlink,
+and non-regular files fail locally without resetting the store. Duplicate keys
+and unsupported versions are rejected. Startup, listing, and no-ops create no
+file. Entries enter model context through tool results only, never system injection.
+Guidance treats them as potentially stale data and directs mutations toward explicit
+remember/correct/forget requests, with no automatic extraction. The CLI flag grants
+write access: prompt wording is not an enforced per-entry approval mechanism.
+
+With credentials configured, this synthetic demo uses two separate processes and
+no resumed conversation:
+
+```sh
+mkdir -m 700 ./demo-memory
+printf '%s\n' 'Remember label=amber using memory_set.' |
+  cargo run -- --memory-dir ./demo-memory
+printf '%s\n' 'Use memory_list and tell me the saved label.' |
+  cargo run -- --memory-dir ./demo-memory
+```
+
+Memory and conversation saving are independent. Mutations validate the proposed
+state before staging a file in the same directory, synchronizing it, and publishing
+atomically (no-clobber for initial creation). Files use 0600 permissions on Unix.
+Only publication updates the runtime state and permits tool success. Earlier
+failures preserve the prior state and return a correlated tool error; the runtime
+does not retry. A successful write survives later model, stdout, or checkpoint
+failure, even when the previous checkpoint remains unchanged. The parent directory
+is not synchronized, so power-loss durability is not guaranteed; crashes may leave
+temporary files. One writer only: concurrent writers, directory replacement, and
+external edits while running are unsupported.
+
+Memory is **plaintext**, not a secrets vault. Tool results are printed, saved in
+checkpoints, and may be sent to Anthropic. Deleting memory does not erase historical
+copies in checkpoints. Resume preserves saved system/history exactly, requires
+`--memory-dir` again for current access, and never replays historical writes.
+Fresh sessions retrieve facts without importing old conversation history.
+
+Learning exercise: run the demo, forget the label in a third process using
+`memory_delete`, then inspect an older checkpoint. Explain why a fresh listing is
+empty while the old conversation can still contain the label.
+
 ## Save and resume
 
 Completed turns save automatically under `$HOME/.hermes-kernel-lab/sessions/`.
@@ -180,6 +235,7 @@ automatic repair, and mid-turn recovery are unsupported.
 | Skill root enumeration | Same directory limits, including ignored entries in the count |
 | Skills catalog | 20 skills; 32 KiB per complete document; 32 KiB serialized metadata listing |
 | Model request / response | 1 MiB each |
+| Memory | 32 entries; 64-byte keys; 1 KiB values; 32 KiB serialized file |
 | Checkpoint | 2 MiB |
 | Model output / HTTP timeout | 512 tokens / 60 seconds per request |
 

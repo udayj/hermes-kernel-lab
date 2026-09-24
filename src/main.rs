@@ -114,7 +114,11 @@ fn load_instructions(tools: &ToolCatalog, path: Option<&Path>) -> Result<String,
 
 fn run() -> Result<(), String> {
     let cli = Cli::parse();
-    let tools = ToolCatalog::open(cli.workspace.as_deref(), cli.skills_dir.as_deref())?;
+    let tools = ToolCatalog::open(
+        cli.workspace.as_deref(),
+        cli.skills_dir.as_deref(),
+        cli.memory_dir.as_deref(),
+    )?;
     let (session, checkpoint) = if let Some(path) = cli.resume_session {
         let checkpoint = Checkpoint::open(&path, true)?;
         (checkpoint.load()?, Some(checkpoint))
@@ -146,7 +150,7 @@ mod tests {
     #[test]
     fn startup_instruction_precedence_and_exact_text() {
         let directory = tempdir().unwrap();
-        let tools = ToolCatalog::open(Some(directory.path()), None).unwrap();
+        let tools = ToolCatalog::open(Some(directory.path()), None, None).unwrap();
         assert_eq!(
             load_instructions(&tools, None).unwrap(),
             compose_instructions(None)
@@ -192,7 +196,7 @@ mod tests {
     #[test]
     fn explicit_instruction_failures_propagate_from_workspace_reads() {
         let directory = tempdir().unwrap();
-        let tools = ToolCatalog::open(Some(directory.path()), None).unwrap();
+        let tools = ToolCatalog::open(Some(directory.path()), None, None).unwrap();
         write(directory.path().join("invalid.bin"), [0xff]).unwrap();
         // Exhaustive filesystem restrictions belong to workspace tests.
         for path in ["missing", "invalid.bin", "../outside"] {
