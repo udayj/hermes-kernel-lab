@@ -11,6 +11,9 @@ pub const MAX_MESSAGE_BYTES: usize = 16 * 1024;
 pub struct Cli {
     #[arg(long, value_name = "PATH")]
     pub workspace: Option<PathBuf>,
+    /// Enable read-only procedures from one trusted local directory.
+    #[arg(long, value_name = "PATH")]
+    pub skills_dir: Option<PathBuf>,
     #[arg(
         long,
         value_name = "PATH",
@@ -86,6 +89,16 @@ mod tests {
         .unwrap();
         assert_eq!(parsed.instructions, Some(PathBuf::from("instructions.txt")));
         assert!(Cli::try_parse_from(["program", "--resume-session", "session.json"]).is_ok());
+        let parsed = Cli::try_parse_from([
+            "program",
+            "--skills-dir",
+            "skills",
+            "--resume-session",
+            "session.json",
+        ])
+        .unwrap();
+        assert_eq!(parsed.skills_dir, Some(PathBuf::from("skills")));
+        assert!(parsed.workspace.is_none());
         for args in [
             vec!["Hello"],
             vec!["--save-session", "session.json"],

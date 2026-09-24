@@ -14,18 +14,23 @@ const MAX_FILE_BYTES: u64 = 32 * 1024;
 const MAX_DIRECTORY_ENTRIES: usize = 200;
 const MAX_DIRECTORY_OUTPUT_BYTES: usize = 32 * 1024;
 
-pub struct Workspace {
+pub struct ReadOnlyDirectory {
     root: Dir,
 }
 
-impl Workspace {
+impl ReadOnlyDirectory {
     pub fn open(path: &Path) -> Result<Self, String> {
         let root = Dir::open_ambient_dir(path, ambient_authority())
-            .map_err(|_| "workspace must be an existing readable directory")?;
+            .map_err(|_| "root must be an existing readable directory")?;
         Ok(Self { root })
     }
 
     pub fn list(&self, path: &str) -> Result<String, String> {
+        let entries = self.entries(path)?;
+        to_string(&entries).map_err(|_| "could not encode the directory listing".into())
+    }
+
+    pub(super) fn entries(&self, path: &str) -> Result<Vec<DirectoryEntry>, String> {
         let components = validate_path(path, true)?;
         let directory = self.open_directory(&components)?;
         let mut entries = Vec::new();
@@ -71,7 +76,7 @@ impl Workspace {
             entries.push(item);
         }
         entries.sort_by(|left, right| left.name.cmp(&right.name));
-        to_string(&entries).map_err(|_| "could not encode the directory listing".into())
+        Ok(entries)
     }
 
     pub fn default_instructions(&self) -> Result<Option<String>, String> {
@@ -121,7 +126,7 @@ impl Workspace {
         let mut directory = self
             .root
             .try_clone()
-            .map_err(|_| "could not access the authorized workspace")?;
+            .map_err(|_| "could not access the authorized directory")?;
         for component in components {
             directory = directory
                 .open_dir_nofollow(component)
@@ -164,10 +169,10 @@ fn validate_path(path: &str, allow_root: bool) -> Result<Vec<String>, String> {
 }
 
 #[derive(Serialize)]
-struct DirectoryEntry {
-    name: String,
+pub(super) struct DirectoryEntry {
+    pub name: String,
     #[serde(rename = "type")]
-    kind: &'static str,
+    pub kind: &'static str,
 }
 
 #[cfg(test)]
@@ -182,9 +187,9 @@ mod tests {
     };
     use tempfile::TempDir;
 
-    fn temporary_workspace() -> (TempDir, Workspace) {
+    fn temporary_workspace() -> (TempDir, ReadOnlyDirectory) {
         let temporary = TempDir::new().unwrap();
-        let workspace = Workspace::open(temporary.path()).unwrap();
+        let workspace = ReadOnlyDirectory::open(temporary.path()).unwrap();
         (temporary, workspace)
     }
 
@@ -293,7 +298,7 @@ mod tests {
         }
         assert!(workspace.list("dir-link").is_err());
 
-        let devices = Workspace::open(Path::new("/dev")).unwrap();
+        let devices = ReadOnlyDirectory::open(Path::new("/dev")).unwrap();
         let error = devices.read("null").unwrap_err();
         assert!(error.contains("not a regular file"));
     }
@@ -303,7 +308,7 @@ mod tests {
         let temporary = TempDir::new().unwrap();
         let file = temporary.path().join("file");
         File::create(&file).unwrap().write_all(b"x").unwrap();
-        assert!(Workspace::open(&file).is_err());
-        assert!(Workspace::open(&temporary.path().join("missing")).is_err());
+        assert!(ReadOnlyDirectory::open(&file).is_err());
+        assert!(ReadOnlyDirectory::open(&temporary.path().join("missing")).is_err());
     }
 }

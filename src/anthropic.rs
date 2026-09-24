@@ -260,9 +260,8 @@ pub fn validate_assistant_content(content: &[ContentBlock]) -> Result<Option<Too
                 if name.is_empty() {
                     return Err("tool request has an empty name".into());
                 }
-                if !input.is_object() {
-                    return Err("tool request input must be a JSON object".into());
-                }
+                // Dispatch validates arguments so even non-object input can
+                // receive a correlated tool error and remain resumable.
                 if tool_call.is_some() {
                     return Err("response contains multiple tool requests".into());
                 }
@@ -345,6 +344,9 @@ mod tests {
         let decoded = decode_response(&to_vec(&body).unwrap()).unwrap();
         assert_eq!(decoded.tool_call.unwrap().name, "future_tool");
         assert_eq!(to_value(decoded.content).unwrap(), body["content"]);
+        let body = tool_response("skill_view", json!(null));
+        let decoded = decode_response(&to_vec(&body).unwrap()).unwrap();
+        assert_eq!(decoded.tool_call.unwrap().input, json!(null));
     }
 
     #[test]
@@ -372,7 +374,7 @@ mod tests {
             json!([valid, valid]),
             json!([{"type":"tool_use","id":"bad id","name":"x","input":{}}]),
             json!([{"type":"tool_use","id":"ok","name":"","input":{}}]),
-            json!([{"type":"tool_use","id":"ok","name":"x","input":null}]),
+            json!([{"type":"tool_use","id":"ok","name":"skill_view"}]),
         ] {
             let mut body = tool_response("get_runtime_info", json!({}));
             body["content"] = content;

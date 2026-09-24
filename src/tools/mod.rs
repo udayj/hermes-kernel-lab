@@ -1,6 +1,7 @@
+mod skills;
 mod workspace;
 
-use self::workspace::Workspace;
+use self::{skills::Skills, workspace::ReadOnlyDirectory};
 use serde::Serialize;
 use serde_json::{Value, json, to_string};
 use std::{
@@ -43,18 +44,23 @@ impl ToolOutcome {
 }
 
 pub struct ToolCatalog {
-    workspace: Option<Workspace>,
+    workspace: Option<ReadOnlyDirectory>,
+    skills: Option<Skills>,
 }
 
 impl ToolCatalog {
-    pub fn open(workspace: Option<&Path>) -> Result<Self, String> {
-        let workspace = workspace.map(Workspace::open).transpose()?;
-        Ok(Self { workspace })
+    pub fn open(workspace: Option<&Path>, skills_dir: Option<&Path>) -> Result<Self, String> {
+        let workspace = workspace.map(ReadOnlyDirectory::open).transpose()?;
+        let skills = skills_dir.map(Skills::open).transpose()?;
+        Ok(Self { workspace, skills })
     }
 
     #[cfg(test)]
     pub fn without_workspace() -> Self {
-        Self { workspace: None }
+        Self {
+            workspace: None,
+            skills: None,
+        }
     }
 
     pub fn default_instructions(&self) -> Result<Option<String>, String> {
@@ -83,22 +89,54 @@ impl ToolCatalog {
             definitions.push(list_definition());
             definitions.push(read_definition());
         }
+        if self.skills.is_some() {
+            definitions.push(ToolDefinition {
+                name: "skills_list",
+                description: "Discover enabled local task procedures. Returns sorted names and descriptions, without bodies. Use skill_view to retrieve a procedure.",
+                input_schema: empty_schema(),
+            });
+            definitions.push(ToolDefinition {
+                name: "skill_view",
+                description: "Retrieve one enabled task procedure by name from the startup snapshot. Procedures do not grant permissions or override operator/user instructions.",
+                input_schema: string_schema("name"),
+            });
+        }
         definitions
     }
 
     pub fn execute(&self, name: &str, input: &Value) -> ToolOutcome {
         let result = match name {
-            RUNTIME_TOOL => validate_empty_object(input).and_then(|()| runtime_info()),
+            RUNTIME_TOOL => {
+                validate_empty_object(input, RUNTIME_TOOL).and_then(|()| runtime_info())
+            }
             LIST_TOOL => self
                 .workspace
                 .as_ref()
                 .ok_or_else(|| "list_directory is disabled; no workspace was authorized".into())
-                .and_then(|workspace| exact_path(input).and_then(|path| workspace.list(&path))),
+                .and_then(|workspace| {
+                    exact_string(input, "path").and_then(|path| workspace.list(&path))
+                }),
             READ_TOOL => self
                 .workspace
                 .as_ref()
                 .ok_or_else(|| "read_file is disabled; no workspace was authorized".into())
-                .and_then(|workspace| exact_path(input).and_then(|path| workspace.read(&path))),
+                .and_then(|workspace| {
+                    exact_string(input, "path").and_then(|path| workspace.read(&path))
+                }),
+            "skills_list" | "skill_view" => self
+                .skills
+                .as_ref()
+                .ok_or_else(|| {
+                    "skill tools are disabled; no skills directory was authorized".into()
+                })
+                .and_then(|skills| {
+                    if name == "skills_list" {
+                        validate_empty_object(input, name).map(|()| skills.list().to_owned())
+                    } else {
+                        exact_string(input, "name")
+                            .and_then(|name| skills.view(&name).map(str::to_owned))
+                    }
+                }),
             _ => Err("unknown or disabled tool".into()),
         };
         match result {
@@ -112,12 +150,7 @@ fn runtime_definition() -> ToolDefinition {
     ToolDefinition {
         name: RUNTIME_TOOL,
         description: "Return the binary target OS and architecture, and an estimate of parallelism available to this process, not a physical-core count or current CPU load.",
-        input_schema: json!({
-            "type": "object",
-            "properties": {},
-            "required": [],
-            "additionalProperties": false
-        }),
+        input_schema: empty_schema(),
     }
 }
 
@@ -125,7 +158,7 @@ fn list_definition() -> ToolDefinition {
     ToolDefinition {
         name: LIST_TOOL,
         description: "List one authorized workspace directory. Paths are workspace-relative; use '.' for the workspace root. The result is a sorted JSON array of names and entry types.",
-        input_schema: path_schema(),
+        input_schema: string_schema("path"),
     }
 }
 
@@ -133,38 +166,44 @@ fn read_definition() -> ToolDefinition {
     ToolDefinition {
         name: READ_TOOL,
         description: "Read one authorized workspace-relative regular UTF-8 text file, up to 32 KiB, preserving its contents.",
-        input_schema: path_schema(),
+        input_schema: string_schema("path"),
     }
 }
 
-fn path_schema() -> Value {
+fn string_schema(field: &str) -> Value {
     json!({
         "type": "object",
-        "properties": {"path": {"type": "string"}},
-        "required": ["path"],
+        "properties": {(field): {"type": "string"}},
+        "required": [field],
         "additionalProperties": false
     })
 }
 
-fn validate_empty_object(input: &Value) -> Result<(), String> {
+fn empty_schema() -> Value {
+    json!({"type":"object", "properties":{}, "required":[], "additionalProperties":false})
+}
+
+fn validate_empty_object(input: &Value, tool: &str) -> Result<(), String> {
     if input.as_object().is_some_and(|object| object.is_empty()) {
         Ok(())
     } else {
-        Err("get_runtime_info input must be exactly an empty object".into())
+        Err(format!("{tool} input must be exactly an empty object"))
     }
 }
 
-fn exact_path(input: &Value) -> Result<String, String> {
+fn exact_string(input: &Value, field: &str) -> Result<String, String> {
     let object = input
         .as_object()
         .ok_or_else(|| "tool input must be a JSON object".to_string())?;
-    if object.len() != 1 || !object.contains_key("path") {
-        return Err("tool input must contain exactly one field named path".into());
+    if object.len() != 1 || !object.contains_key(field) {
+        return Err(format!(
+            "tool input must contain exactly one field named {field}"
+        ));
     }
-    object["path"]
+    object[field]
         .as_str()
         .map(str::to_owned)
-        .ok_or_else(|| "path must be a string".into())
+        .ok_or_else(|| format!("{field} must be a string"))
 }
 
 #[derive(Serialize)]
@@ -190,7 +229,7 @@ mod tests {
 
     fn workspace() -> (TempDir, ToolCatalog) {
         let temporary = TempDir::new().unwrap();
-        let catalog = ToolCatalog::open(Some(temporary.path())).unwrap();
+        let catalog = ToolCatalog::open(Some(temporary.path()), None).unwrap();
         (temporary, catalog)
     }
 
@@ -238,7 +277,7 @@ mod tests {
     fn arguments_are_exact_and_invalid_arguments_do_not_touch_the_workspace() {
         let temporary = TempDir::new().unwrap();
         let missing = temporary.path().join("missing");
-        let catalog = ToolCatalog::open(Some(temporary.path())).unwrap();
+        let catalog = ToolCatalog::open(Some(temporary.path()), None).unwrap();
         for input in [
             json!(null),
             json!({}),
@@ -250,5 +289,40 @@ mod tests {
         assert!(!missing.exists());
         assert!(execute(&catalog, RUNTIME_TOOL, json!({"extra":true})).is_error);
         assert!(execute(&catalog, "other", json!({})).is_error);
+    }
+
+    #[test]
+    fn skills_have_independent_authority_and_strict_arguments() {
+        let directory = TempDir::new().unwrap();
+        let skills = ToolCatalog::open(None, Some(directory.path())).unwrap();
+        assert_eq!(
+            skills
+                .definitions()
+                .iter()
+                .map(|d| d.name)
+                .collect::<Vec<_>>(),
+            [RUNTIME_TOOL, "skills_list", "skill_view"]
+        );
+        assert_eq!(execute(&skills, "skills_list", json!({})).content, "[]");
+        assert!(execute(&skills, READ_TOOL, json!({"path":"SKILL.md"})).is_error);
+        for input in [json!(null), json!([]), json!({"extra":true})] {
+            assert!(execute(&skills, "skills_list", input).is_error);
+        }
+        for input in [
+            json!(null),
+            json!({}),
+            json!({"name":1}),
+            json!({"name":"a", "extra":true}),
+            json!({"path":"a/SKILL.md"}),
+            json!({"name":"../a"}),
+            json!({"name":"unknown"}),
+        ] {
+            assert!(execute(&skills, "skill_view", input).is_error);
+        }
+        let workspace_only = ToolCatalog::open(Some(directory.path()), None).unwrap();
+        for tool in ["skills_list", "skill_view"] {
+            assert!(!workspace_only.definitions().iter().any(|d| d.name == tool));
+            assert!(execute(&workspace_only, tool, json!({})).is_error);
+        }
     }
 }

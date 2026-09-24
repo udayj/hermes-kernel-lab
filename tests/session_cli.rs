@@ -1,5 +1,5 @@
 use std::{
-    fs::{read, write},
+    fs::{create_dir_all, read, write},
     io::Write,
     process::{Command, Stdio},
 };
@@ -41,8 +41,18 @@ fn cli_validates_before_credentials_and_no_turn_exits_never_write() {
     write(&path, saved).unwrap();
     // Resume must not attempt to load even an invalid root instruction file.
     write(directory.path().join("AGENTS.md"), [0xff]).unwrap();
+    create_dir_all(directory.path().join("skills/sample")).unwrap();
+    write(
+        directory.path().join("skills/sample/SKILL.md"),
+        "---\nname: sample\ndescription: Synthetic procedure\n---\nRead a file.\n",
+    )
+    .unwrap();
     for (args, input) in [
         (vec!["--resume-session", "saved.json"], ""),
+        (
+            vec!["--resume-session", "saved.json", "--skills-dir", "skills"],
+            "",
+        ),
         (
             vec!["--resume-session", "saved.json", "--workspace", "."],
             "\n/exit\n",
@@ -51,6 +61,24 @@ fn cli_validates_before_credentials_and_no_turn_exits_never_write() {
         assert!(invoke(&args, input).status.success());
         assert_eq!(read(&path).unwrap(), saved);
     }
+    write(directory.path().join("skills/sample/SKILL.md"), "invalid").unwrap();
+    for args in [
+        vec!["--skills-dir", "skills"],
+        vec!["--resume-session", "saved.json", "--skills-dir", "skills"],
+    ] {
+        let output = invoke(&args, "Hello\n");
+        assert!(!output.status.success());
+        let error = String::from_utf8(output.stderr).unwrap();
+        assert!(error.contains("skills catalog"), "{error}");
+        assert!(!error.contains("ANTHROPIC_API_KEY"), "{error}");
+        assert_eq!(read(&path).unwrap(), saved);
+    }
+    // An unselected invalid catalog is never loaded on resume.
+    assert!(
+        invoke(&["--resume-session", "saved.json"], "")
+            .status
+            .success()
+    );
     write(&path, "not json").unwrap();
     let output = invoke(&["--resume-session", "saved.json"], "Hello\n");
     assert!(!output.status.success());

@@ -7,8 +7,8 @@ smaller form without aiming for feature parity or translating its architecture
 directly.
 
 A small Rust agent CLI using Anthropic’s Claude Haiku 4.5
-(`claude-haiku-4-5-20251001`), with read-only workspace tools and automatic
-conversation saving.
+(`claude-haiku-4-5-20251001`), with read-only workspace tools, opt-in local skills,
+and automatic conversation saving.
 
 ## Run
 
@@ -51,6 +51,74 @@ rename root `AGENTS.md` to omit it from new sessions.
 Workspace names and file contents may be sent to Anthropic. Hidden-file exclusion
 is not secret detection or full process isolation.
 
+## Local skills
+
+`--skills-dir PATH` authorizes one trusted local directory independently of
+`--workspace`. It enables `skills_list({})`, which returns a name-sorted JSON array
+of names and descriptions, and `skill_view({"name":"..."})`, which returns exactly
+one original skill document. Without the flag, both tools are disabled. The model
+selects a name, never a filesystem path. Skills do not enable workspace tools.
+
+Only immediate `<name>/SKILL.md` documents are loaded. Hidden root entries and
+ordinary root files are ignored; every visible immediate directory must contain a
+valid skill. Symlink and special root entries are rejected. Reads beneath the
+authorized root use the same capability-relative restrictions as workspace reads:
+no symlink or parent traversal, and only regular UTF-8 files. An empty catalog is
+valid. An invalid selected catalog stops startup locally, even on resume, before
+credentials or model requests; no partial catalog is used.
+
+The supported format is a YAML frontmatter mapping followed by a nonblank
+Markdown body, with `---` delimiters on their own lines (LF or CRLF):
+
+```markdown
+---
+name: workspace-overview
+description: Summarize an authorized workspace using read-only tools.
+---
+List the workspace root and read README.md if present. Summarize what you find.
+```
+
+The mapping must contain exactly `name` and `description`, deserialized into Rust
+strings using the YAML crate's normal behavior. Plain, quoted, and block scalars
+are supported; numeric/boolean-looking scalars such as `123` and `true` are accepted
+as text. Missing, duplicate, unknown, or collection-valued fields are rejected,
+as are blank descriptions. Names must match the directory
+name: 1–64 lowercase ASCII letters/digits, optionally separated by single interior
+hyphens. YAML parsing uses pinned `serde_yaml_ng` 0.10.0; there is no custom YAML
+parser. This follows the core [Agent Skills format](https://agentskills.io/specification),
+but is not a full implementation: optional frontmatter fields are rejected, and
+descriptions are bounded by our file/listing limits rather than the specification's
+1,024-character limit. Markdown is retained verbatim, not interpreted by the runtime. Scripts,
+reference-file expansion, skill writing, installation, and global/project discovery
+are unsupported.
+
+All selected documents are **snapshotted in memory at startup**, once per
+invocation. Delivery to the model is on demand: listing exposes metadata only;
+full documents enter history through `skill_view` results. Neither catalog nor
+bodies are injected into the system prompt. Changes to disk do not affect the
+current process; later invocations may load changed documents. Startup reads are
+sequential, not an atomic snapshot of concurrent filesystem edits.
+
+Fresh-session guidance treats skills as subordinate task procedures, not permission
+grants or overrides of operator/user instructions. Ordinary file results remain
+data. Skill results are printed and saved like other tool results and may be sent
+to Anthropic. Loading a procedure does not guarantee that a model follows it.
+
+Two deliberately synthetic examples use the existing workspace fixture:
+`workspace-overview` lists the root and reads its README; `worker-config-review`
+reads and explains `worker.toml`. With credentials configured, try:
+
+```sh
+printf '%s\n' \
+  'List available skills, load worker-config-review, and use it to review worker.toml.' |
+  cargo run -- --skills-dir ./examples/skills --workspace ./examples/workspace
+```
+
+Learning exercise: in an interactive stdin session, request a skill, edit its body
+on disk, and request it again. Then resume with `--skills-dir` and request it once
+more. Explain why the first process returns its original snapshot, while the new
+process can return changed content alongside the unchanged historical result.
+
 ## Save and resume
 
 Completed turns save automatically under `$HOME/.hermes-kernel-lab/sessions/`.
@@ -77,6 +145,13 @@ Credentials and workspace access come from the current invocation. Supply
 results remain in history, but new workspace access is disabled. The checkpoint
 path is independent of the workspace and does not authorize file access.
 
+Likewise, supply `--skills-dir` again to enable new skill reads. Without it,
+previous skill results remain in history but both skill tools are disabled.
+With it, startup rebuilds the catalog from current files. Resume preserves the
+saved system text exactly, including text from sessions predating skills; it does
+not inject new guidance or replay historical loads. The checkpoint stores no
+skill directory or catalog and grants no skill access.
+
 Checkpoints are **plaintext and must be trusted**. They contain conversation text
 and may contain file contents or secrets included in that text. Credentials and
 workspace permissions are not stored; transcript secrets are not redacted.
@@ -102,11 +177,14 @@ automatic repair, and mid-turn recovery are unsupported.
 | User message | 16 KiB |
 | Workspace or instruction file | 32 KiB |
 | Directory listing | 200 examined entries; 32 KiB serialized output |
+| Skill root enumeration | Same directory limits, including ignored entries in the count |
+| Skills catalog | 20 skills; 32 KiB per complete document; 32 KiB serialized metadata listing |
 | Model request / response | 1 MiB each |
 | Checkpoint | 2 MiB |
 | Model output / HTTP timeout | 512 tokens / 60 seconds per request |
 
-Tool errors are returned to the model. Protocol, transport, budget, and output
+Invalid tool arguments (including non-object inputs), unknown names, and disabled
+tools return correlated tool errors to the model. Protocol, transport, budget, and output
 failures stop the program. A tool request on the eighth model call fails before
 execution. Each user turn gets a fresh call budget, including after resume.
 
@@ -124,4 +202,7 @@ cargo clippy --offline --all-targets -- -D warnings
 
 Tests use synthetic data, scripted model responses, and temporary files; they
 require no credentials or live model requests. Live-provider integration is not
-covered by these checks.
+covered by these checks. Skill tests verify metadata/body separation, bounded
+snapshots, argument and filesystem failures, actual request histories through
+list → view → workspace read → answer, and save/resume authorization. They verify
+orchestration, not whether a live model follows a procedure correctly.

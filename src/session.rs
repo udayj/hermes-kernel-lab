@@ -292,7 +292,6 @@ mod tests {
             ("/messages/2/content/0/tool_use_id", json!("wrong")),
             ("/messages/2/content/0/is_error", json!("true")),
             ("/messages/1/content/1/id", json!("bad id")),
-            ("/messages/1/content/1/input", json!(null)),
         ] {
             let mut invalid = correlated.clone();
             *invalid.pointer_mut(pointer).unwrap() = value;
@@ -309,6 +308,10 @@ mod tests {
             write(&path, invalid).unwrap();
             assert!(Checkpoint::open(&path, true).unwrap().load().is_err());
         }
+        write(&path, to_vec(&correlated).unwrap()).unwrap();
+        assert!(Checkpoint::open(&path, true).unwrap().load().is_ok());
+        // Invalid arguments are retained with their correlated tool error.
+        correlated["messages"][1]["content"][1]["input"] = json!(null);
         write(&path, to_vec(&correlated).unwrap()).unwrap();
         assert!(Checkpoint::open(&path, true).unwrap().load().is_ok());
     }
