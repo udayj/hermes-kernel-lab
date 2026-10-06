@@ -1,3 +1,4 @@
+use crate::bounded::{ReadError, read_bounded};
 use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt};
 use cap_std::{
     ambient_authority,
@@ -6,7 +7,7 @@ use cap_std::{
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
-    io::{ErrorKind, Read, Write},
+    io::{ErrorKind, Write},
     path::{Path, PathBuf},
 };
 use tempfile::NamedTempFile;
@@ -59,13 +60,10 @@ impl Memory {
         {
             return Err("memory.json must be a regular file".into());
         }
-        let mut bytes = Vec::new();
-        file.take(MAX_BYTES as u64 + 1)
-            .read_to_end(&mut bytes)
-            .map_err(|_| "could not read memory.json")?;
-        if bytes.len() > MAX_BYTES {
-            return Err("memory.json exceeds 32 KiB".into());
-        }
+        let bytes = read_bounded(file, MAX_BYTES as u64).map_err(|error| match error {
+            ReadError::Io => "could not read memory.json",
+            ReadError::TooLarge => "memory.json exceeds 32 KiB",
+        })?;
         memory.store =
             serde_json::from_slice(&bytes).map_err(|_| "invalid memory JSON or schema")?;
         encode(&memory.store)?;

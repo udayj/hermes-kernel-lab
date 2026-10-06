@@ -1,15 +1,18 @@
 mod agent;
 mod anthropic;
+mod bounded;
 mod cli;
 mod session;
 mod tools;
 
 use agent::{Agent, compose_instructions};
+use bounded::{ReadError, read_bounded};
 use clap::Parser;
 use cli::{Cli, StdinEvent, read_stdin_event};
 use dotenvy::from_read_iter;
 use session::{Checkpoint, Session};
 use std::{
+    collections::VecDeque,
     env::{VarError, var, var_os},
     fs::File,
     io::{IsTerminal, Read, Write, stderr, stdin, stdout},
@@ -49,6 +52,7 @@ fn run_stdin(
     tools: ToolCatalog,
     session: Session,
     checkpoint: Option<Checkpoint>,
+    mut script: Option<VecDeque<serde_json::Value>>,
 ) -> Result<(), String> {
     let stdin = stdin();
     let show_prompt = stdin.is_terminal();
@@ -69,7 +73,11 @@ fn run_stdin(
             StdinEvent::Exit | StdinEvent::Eof => return Ok(()),
             StdinEvent::Message(message) => {
                 if agent.is_none() {
-                    let key = api_key()?;
+                    let key = if script.is_none() {
+                        Some(api_key()?)
+                    } else {
+                        None
+                    };
                     let (tools, session, checkpoint) =
                         startup.take().expect("agent is initialized only once");
                     let checkpoint = match checkpoint {
@@ -81,7 +89,15 @@ fn run_stdin(
                             Checkpoint::automatic(Path::new(&home))?
                         }
                     };
-                    agent = Some(Agent::new(key, tools, session, checkpoint)?);
+                    agent = Some(match script.take() {
+                        Some(script) => Agent::from_script(script, tools, session, checkpoint),
+                        None => Agent::new(
+                            key.expect("live credentials loaded"),
+                            tools,
+                            session,
+                            checkpoint,
+                        )?,
+                    });
                 }
                 if let Some(path) = agent
                     .as_mut()
@@ -114,19 +130,37 @@ fn load_instructions(tools: &ToolCatalog, path: Option<&Path>) -> Result<String,
 
 fn run() -> Result<(), String> {
     let cli = Cli::parse();
-    let tools = ToolCatalog::open(
+    let mut tools = ToolCatalog::open(
         cli.workspace.as_deref(),
         cli.skills_dir.as_deref(),
         cli.memory_dir.as_deref(),
     )?;
-    let (session, checkpoint) = if let Some(path) = cli.resume_session {
-        let checkpoint = Checkpoint::open(&path, true)?;
-        (checkpoint.load()?, Some(checkpoint))
+    let (session, checkpoint) = if let Some(path) = &cli.resume_session {
+        let checkpoint = Checkpoint::open(path, true)?;
+        let session = checkpoint
+            .load()
+            .map_err(|error| format!("{}: {error}", checkpoint.path().display()))?;
+        (session, Some(checkpoint))
     } else {
         let system = load_instructions(&tools, cli.instructions.as_deref())?;
         (Session::new(system), None)
     };
-    run_stdin(tools, session, checkpoint)
+    let script = if let Some(path) = &cli.offline_script {
+        let file = File::open(path).map_err(|_| "could not open offline script")?;
+        let bytes = read_bounded(file, 1024 * 1024).map_err(|error| match error {
+            ReadError::Io => "could not read offline script",
+            ReadError::TooLarge => "offline script exceeds 1 MiB",
+        })?;
+        Some(
+            serde_json::from_slice::<VecDeque<serde_json::Value>>(&bytes).map_err(
+                |_| "offline script must be a JSON array of synthetic provider messages",
+            )?,
+        )
+    } else {
+        None
+    };
+    tools.configure(cli.allow_workspace_writes, cli.allow_shell)?;
+    run_stdin(tools, session, checkpoint, script)
 }
 
 fn main() -> ExitCode {

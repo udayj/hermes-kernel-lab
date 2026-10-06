@@ -4,6 +4,7 @@ use crate::{
     tools::{ToolCatalog, ToolDefinition, ToolOutcome},
 };
 use std::{
+    collections::VecDeque,
     io::{Result as IoResult, Write},
     path::PathBuf,
 };
@@ -22,7 +23,7 @@ pub fn compose_instructions(operator: Option<&str>) -> String {
 pub const MAX_MODEL_CALLS_PER_TURN: usize = 8;
 
 pub struct Agent {
-    client: Client,
+    client: Model,
     session: Session,
     checkpoint: Checkpoint,
     tools: ToolCatalog,
@@ -36,11 +37,25 @@ impl Agent {
         checkpoint: Checkpoint,
     ) -> Result<Self, String> {
         Ok(Self {
-            client: Client::new(key)?,
+            client: Model::Live(Client::new(key)?),
             session,
             checkpoint,
             tools,
         })
+    }
+
+    pub fn from_script(
+        script: VecDeque<serde_json::Value>,
+        tools: ToolCatalog,
+        session: Session,
+        checkpoint: Checkpoint,
+    ) -> Self {
+        Self {
+            client: Model::Script(script),
+            tools,
+            session,
+            checkpoint,
+        }
     }
 
     pub fn run_turn(
@@ -56,6 +71,34 @@ impl Agent {
             output,
             |system, history, definitions| self.client.send(system, history, definitions),
         )
+    }
+}
+
+enum Model {
+    Live(Client),
+    Script(VecDeque<serde_json::Value>),
+}
+
+impl Model {
+    fn send(
+        &mut self,
+        system: &str,
+        history: &[Message],
+        definitions: &[ToolDefinition],
+    ) -> Result<AssistantResponse, String> {
+        match self {
+            Self::Live(client) => client.send(system, history, definitions),
+            Self::Script(script) => {
+                // Preserve the live request-size boundary in the offline driver.
+                crate::anthropic::encode_request(system, history, definitions)?;
+                let value = script
+                    .pop_front()
+                    .ok_or("offline script has no remaining responses")?;
+                let body =
+                    serde_json::to_vec(&value).map_err(|_| "could not encode offline response")?;
+                crate::anthropic::decode_response(&body)
+            }
+        }
     }
 }
 
@@ -666,7 +709,7 @@ mod tests {
             (
                 "read-2",
                 json!({}),
-                "tool input must contain exactly one field named path",
+                "invalid tool argument fields or types",
                 true,
             ),
         ] {

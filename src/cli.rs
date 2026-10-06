@@ -11,6 +11,15 @@ pub const MAX_MESSAGE_BYTES: usize = 16 * 1024;
 pub struct Cli {
     #[arg(long, value_name = "PATH")]
     pub workspace: Option<PathBuf>,
+    /// Permit native workspace mutations and workspace writes by authorized shells.
+    #[arg(long, requires = "workspace")]
+    pub allow_workspace_writes: bool,
+    /// Permit sandboxed, noninteractive shells (macOS only).
+    #[arg(long, requires = "workspace")]
+    pub allow_shell: bool,
+    /// Consume synthetic provider responses from a JSON array without HTTP or credentials.
+    #[arg(long, value_name = "PATH")]
+    pub offline_script: Option<PathBuf>,
     /// Enable read-only procedures from one trusted local directory.
     #[arg(long, value_name = "PATH")]
     pub skills_dir: Option<PathBuf>,

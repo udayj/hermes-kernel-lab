@@ -1,6 +1,7 @@
 use crate::{
     agent::MAX_MODEL_CALLS_PER_TURN,
     anthropic::{ContentBlock, MODEL, Message, validate_assistant_content},
+    bounded::{ReadError, read_bounded},
     cli::validate_text,
 };
 use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt};
@@ -12,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{from_slice, to_writer};
 use std::{
     fs::{DirBuilder, symlink_metadata},
-    io::{ErrorKind, Read, Write},
+    io::{ErrorKind, Write},
     path::{Path, PathBuf},
     process::id,
     time::{SystemTime, UNIX_EPOCH},
@@ -95,6 +96,9 @@ pub struct Checkpoint {
 }
 
 impl Checkpoint {
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
     pub fn automatic(home: &Path) -> Result<Self, String> {
         if !home.is_absolute() || !home.is_dir() {
             return Err("HOME must name an existing absolute directory".into());
@@ -170,13 +174,10 @@ impl Checkpoint {
         {
             return Err("checkpoint must be a regular file".into());
         }
-        let mut bytes = Vec::new();
-        file.take(MAX_SESSION_BYTES as u64 + 1)
-            .read_to_end(&mut bytes)
-            .map_err(|_| "could not read checkpoint")?;
-        if bytes.len() > MAX_SESSION_BYTES {
-            return Err("checkpoint exceeds the 2 MiB limit".into());
-        }
+        let bytes = read_bounded(file, MAX_SESSION_BYTES as u64).map_err(|error| match error {
+            ReadError::Io => "could not read checkpoint",
+            ReadError::TooLarge => "checkpoint exceeds the 2 MiB limit",
+        })?;
         let session: Session =
             from_slice(&bytes).map_err(|_| "invalid checkpoint JSON or message schema")?;
         session.validate()?;

@@ -1,23 +1,17 @@
 # Hermes, Oxidized
 
 A learning project exploring agent runtimes by growing a small Rust program.
-Hermes is both a capability reference and a low-fidelity design and
-implementation reference: this project reconstructs selected mechanisms in a
-smaller form without aiming for feature parity or translating its architecture
-directly.
+Hermes is a capability reference and case study. The aim is to understand agent
+mechanisms, state, and boundaries through a small implementation, without aiming
+for feature parity or translating its architecture.
 
-A small Rust agent CLI using Anthropic’s Claude Haiku 4.5
-(`claude-haiku-4-5-20251001`), with read-only workspace tools, opt-in local skills,
-opt-in cross-session memory, and automatic conversation saving.
+The CLI uses Anthropic’s Claude Haiku 4.5 (`claude-haiku-4-5-20251001`). It has
+workspace tools, opt-in local skills and cross-session memory, automatic
+conversation saving, and sandboxed command execution on macOS.
 
 ## Run
 
-Set `ANTHROPIC_API_KEY` in the environment or a `.env` file in the current directory:
-
-```dotenv
-ANTHROPIC_API_KEY=your-key
-```
-
+Set `ANTHROPIC_API_KEY` in the environment or a `.env` file in the current directory.
 An existing environment variable takes precedence. API requests incur usage charges.
 
 ```sh
@@ -26,229 +20,184 @@ cargo run -- --workspace ./examples/workspace
 printf '%s\n' 'Say hello in one sentence.' | cargo run --
 ```
 
-Enter one message per line on stdin. Blank lines are ignored; `/exit` or EOF exits.
-Output goes to stdout; prompts, the resume path, and errors go to stderr.
+Enter one message per stdin line. Blank lines are ignored; `/exit` or EOF exits.
+Answers and tool results go to stdout; prompts, resume paths, and errors go to stderr.
 
-## Workspace and instructions
+## Workspace tools and permissions
 
-`--workspace PATH` enables `list_directory` and `read_file` within that directory.
-Paths must be workspace-relative; absolute paths, parent traversal, hidden path
-components, and symlink traversal are rejected. Files must be regular UTF-8 text.
-`get_runtime_info` is always available and reports target OS, architecture, and
-available parallelism. Workspace and skill tools are read-only. Only the opt-in memory tools can write; there are no shell tools.
+`--workspace PATH` selects an existing, narrow project directory. Access is read-only
+by default. `get_runtime_info` is available even without a workspace.
 
-Fresh sessions use built-in system instructions plus one optional file:
+| Tool | Contract |
+| --- | --- |
+| `list_directory({path})` | One directory, sorted names and entry types; `.` selects the root. |
+| `read_file({path})` | A regular UTF-8 file, at most 32 KiB. |
+| `read_file({path, start_line, end_line})` | Both bounds required, one-based and inclusive; at most 1,000 lines and 32 KiB returned, with an 8 MiB scan bound. A start beyond EOF fails; an end beyond EOF returns available lines. Only the scanned prefix is validated as UTF-8. |
+| `write_file({path, content, overwrite?})` | Publish at most 32 KiB of text atomically in an existing parent. `overwrite` defaults to false. |
+| `patch({path, old_text, new_text})` | Atomically replace exactly one occurrence. Empty, missing, or ambiguous matches, including overlapping matches, fail without mutation. |
+| `bash({command})` | macOS: a fresh noninteractive shell; returns after foreground execution and cleanup. |
 
-- `--instructions PATH` selects a workspace-relative file and requires `--workspace`.
-- Otherwise, `--workspace` loads its root `AGENTS.md` if present.
-- Without a workspace or root `AGENTS.md`, only built-in instructions are used.
+The independent flags `--allow-workspace-writes` and `--allow-shell` require
+`--workspace`. Writes enable `write_file` and `patch`; shell consent enables `bash`.
+Shell consent alone permits writes only to private workspace scratch.
+Enforcement applies to dispatch as well as advertised tools. Bash with both flags
+can overwrite or delete ordinary workspace files: consent grants that authority
+for the invocation, without per-command human approval.
 
-Instructions are read once, with the same restrictions as workspace files. Only
-an absent default `AGENTS.md` is optional; other read failures stop startup.
-There is no parent, nested, or global discovery, merging, or hot reload. Remove or
-rename root `AGENTS.md` to omit it from new sessions.
+Native paths are contained by a `cap_std::fs::Dir`. Relative symlinks within the
+workspace may be followed; escaping paths fail. Dot-prefixed components and
+resolved hidden targets are inaccessible. `AGENTS.md` cannot be written, including
+through a symlink alias. Files must be regular UTF-8 files within the read bound.
+Use `grep` through `bash` for search; it requires `--allow-shell`.
 
-Workspace names and file contents may be sent to Anthropic. Hidden-file exclusion
-is not secret detection or full process isolation.
+## Command boundary and lifecycle
 
-## Local skills
+A plain `--workspace` run uses native file tools and requires no Seatbelt or
+external search executable. `--allow-shell` creates the macOS Seatbelt sandbox
+and foreground runner. Initialization probes enforcement and fails closed, with
+no unsandboxed fallback. Shell consent is rejected on other platforms.
 
-`--skills-dir PATH` authorizes one trusted local directory independently of
-`--workspace`. It enables `skills_list({})`, which returns a name-sorted JSON array
-of names and descriptions, and `skill_view({"name":"..."})`, which returns exactly
-one original skill document. Without the flag, both tools are disabled. The model
-selects a name, never a filesystem path. Skills do not enable workspace tools.
+The launcher uses fixed `/usr/bin/sandbox-exec` and `/bin/bash` paths. Its policy
+denies access by default, permits workspace and required system reads, and allows
+writes to private scratch or, with write consent, ordinary workspace files.
+Dotfiles are inaccessible except for shell scratch; `AGENTS.md` is read-only.
+Network and host socket/IPC access are denied. Descendants inherit the sandbox.
 
-Only immediate `<name>/SKILL.md` documents are loaded. Hidden root entries and
-ordinary root files are ignored; every visible immediate directory must contain a
-valid skill. Symlink and special root entries are rejected. Reads beneath the
-authorized root use the same capability-relative restrictions as workspace reads:
-no symlink or parent traversal, and only regular UTF-8 files. An empty catalog is
-valid. An invalid selected catalog stops startup locally, even on resume, before
-credentials or model requests; no partial catalog is used.
+Each shell starts without startup files, with `/dev/null` stdin, a cleared
+environment, controlled `PATH=/usr/bin:/bin`, and captured stdout/stderr. HOME,
+temporary files, and caches use a private `.hermes-scratch-*` directory inside
+the workspace. Scratch persists after exit and can be removed by the operator.
+The parent stays outside Seatbelt for model HTTP, checkpoints, and memory.
 
-The supported format is a YAML frontmatter mapping followed by a nonblank
-Markdown body, with `---` delimiters on their own lines (LF or CRLF):
+Each tool call owns its command until execution and cleanup finish. The agent
+then receives one result containing stdout, stderr, exit code or signal,
+`timed_out`, and `truncated`. `subprocess` handles spawning, pipe draining,
+process-group signalling, and reaping; `rustix` observes exit without reaping.
+At most 32 KiB per stream is retained, with excess drained and discarded. Invalid
+UTF-8 is replaced. Per-read time and byte bounds keep output floods from starving
+the 30-second deadline.
 
-```markdown
----
-name: workspace-overview
-description: Summarize an authorized workspace using read-only tools.
----
-List the workspace root and read README.md if present. Summarize what you find.
-```
+Completion, timeout, or INT/TERM/HUP sends SIGKILL to the command's process group.
+Output drains before the leader is reaped. Pipes that remain open after one second
+of final draining produce a tool error. Signals exit the CLI after cleanup; while
+idle they perform their default action. Resume never replays commands. There is
+no background-job interface, PTY, interactive child stdin, or persistent shell.
 
-The mapping must contain exactly `name` and `description`, deserialized into Rust
-strings using the YAML crate's normal behavior. Plain, quoted, and block scalars
-are supported; numeric/boolean-looking scalars such as `123` and `true` are accepted
-as text. Missing, duplicate, unknown, or collection-valued fields are rejected,
-as are blank descriptions. Names must match the directory
-name: 1–64 lowercase ASCII letters/digits, optionally separated by single interior
-hyphens. YAML parsing uses pinned `serde_yaml_ng` 0.10.0; there is no custom YAML
-parser. This follows the core [Agent Skills format](https://agentskills.io/specification),
-but is not a full implementation: optional frontmatter fields are rejected, and
-descriptions are bounded by our file/listing limits rather than the specification's
-1,024-character limit. Markdown is retained verbatim, not interpreted by the runtime. Scripts,
-reference-file expansion, skill writing, installation, and global/project discovery
-are unsupported.
+The operator selects trusted checkpoint, memory, skills, `.env`, and offline-script
+inputs outside the writable workspace. Model arguments, commands, and workspace
+contents are untrusted. Concurrent filesystem mutation and pre-existing hard-link
+aliases to outside files are unsupported. Parent SIGKILL and deliberately detached
+descendants are outside process-group cleanup guarantees. There are no CPU, disk,
+or process-count quotas. Workspace contents and output can enter model requests
+and plaintext checkpoints.
 
-All selected documents are **snapshotted in memory at startup**, once per
-invocation. Delivery to the model is on demand: listing exposes metadata only;
-full documents enter history through `skill_view` results. Neither catalog nor
-bodies are injected into the system prompt. Changes to disk do not affect the
-current process; later invocations may load changed documents. Startup reads are
-sequential, not an atomic snapshot of concurrent filesystem edits.
+## Offline demonstration
 
-Fresh-session guidance treats skills as subordinate task procedures, not permission
-grants or overrides of operator/user instructions. Ordinary file results remain
-data. Skill results are printed and saved like other tool results and may be sent
-to Anthropic. Loading a procedure does not guarantee that a model follows it.
-
-Two deliberately synthetic examples use the existing workspace fixture:
-`workspace-overview` lists the root and reads its README; `worker-config-review`
-reads and explains `worker.toml`. With credentials configured, try:
+This macOS demo uses synthetic provider messages, temporary data, real tools,
+and the compiled stdin CLI. It needs no credentials or live model connection.
+Build before changing HOME so the normal Rust toolchain remains available.
 
 ```sh
-printf '%s\n' \
-  'List available skills, load worker-config-review, and use it to review worker.toml.' |
-  cargo run -- --skills-dir ./examples/skills --workspace ./examples/workspace
+cargo build --offline
+demo_root=$(mktemp -d)
+mkdir "$demo_root/workspace" "$demo_root/home"
+printf 'amber\n' > "$demo_root/workspace/source.txt"
+printf 'Run the synthetic workflow\n/exit\n' |
+  HOME="$demo_root/home" ./target/debug/hermes-kernel-lab \
+    --workspace "$demo_root/workspace" \
+    --allow-workspace-writes --allow-shell \
+    --offline-script examples/offline-workspace.json
+cat "$demo_root/workspace/output.txt"
 ```
 
-Learning exercise: in an interactive stdin session, request a skill, edit its body
-on disk, and request it again. Then resume with `--skills-dir` and request it once
-more. Explain why the first process returns its original snapshot, while the new
-process can return changed content alongside the unchanged historical result.
+The fixture searches with bash/grep, reads, writes, patches `amber` to `blue`, runs an offline
+shell check, reads the result, and answers. `output.txt` contains `blue`, and the
+checkpoint is under the disposable HOME. `--offline-script PATH` consumes a JSON
+array of synthetic Anthropic response objects, at most 1 MiB. It uses the same
+response validation, request-size check, and turn budget as live operation.
+It demonstrates orchestration and tool effects, not live model behavior.
 
-## Cross-session memory
+## Instructions and local skills
 
-`--memory-dir PATH` authorizes reading and writing one fixed `memory.json` in an
-existing trusted directory, independently of workspace and skills access. Without
-this flag, memory tools are disabled. Model arguments select text keys, never paths.
-The versioned JSON store has the shape `{"version":1,"entries":{"label":"amber"}}`.
+Fresh sessions combine built-in guidance with root workspace `AGENTS.md`, if
+present. `--instructions PATH` selects one workspace-relative UTF-8 file instead,
+within the ordinary read limit. Reads happen once. Only a missing default file is
+optional; other read failures stop startup. There is no nested/global discovery,
+merging, or hot reload. Resume uses saved system text exactly and rejects
+`--instructions`.
 
-`memory_list({})` returns the entries as a key-sorted JSON object.
-`memory_set({"key":"label","value":"amber"})` inserts or replaces one fact;
-`memory_delete({"key":"label"})` removes it. Deleting an absent key or setting the
-same value is a successful no-op. Limits are 32 entries, nonblank keys up to 64
-UTF-8 bytes, nonblank values up to 1,024 bytes, and 32 KiB for the complete
-serialized file, including JSON escaping. Accepted whitespace is preserved.
+`--skills-dir PATH` independently selects one trusted local directory. It enables
+`skills_list({})` for name-sorted metadata and `skill_view({name})` for one original
+document. Only immediate `<name>/SKILL.md` files are loaded. Hidden root entries and
+ordinary root files are ignored; visible directories must contain valid skills.
+Symlink entries at the catalog root, escaping paths, and special files fail.
+An empty catalog is valid; an invalid catalog
+stops startup without partially loading it.
 
-Startup loads and validates memory once, before credentials or model requests.
-Missing memory means empty memory; malformed, unreadable, oversized, symlink,
-and non-regular files fail locally without resetting the store. Duplicate keys
-and unsupported versions are rejected. Startup, listing, and no-ops create no
-file. Entries enter model context through tool results only, never system injection.
-Guidance treats them as potentially stale data and directs mutations toward explicit
-remember/correct/forget requests, with no automatic extraction. The CLI flag grants
-write access: prompt wording is not an enforced per-entry approval mechanism.
+Documents have YAML frontmatter with exactly string fields `name` and
+`description`, then a nonblank Markdown body. Names match their directory: 1–64
+lowercase ASCII letters/digits separated by optional single interior hyphens.
+Descriptions must be nonblank. Pinned `serde_yaml_ng` 0.10.0 supports normal scalar
+forms; duplicate, unknown, missing, and collection-valued fields fail. This supports
+the core [Agent Skills format](https://agentskills.io/specification), with optional
+fields rejected and descriptions bounded by file/catalog limits.
 
-With credentials configured, this synthetic demo uses two separate processes and
-no resumed conversation:
+The catalog and bodies are snapshotted once at startup. Metadata enters history
+through listing, bodies through viewing; neither is injected into system text.
+Procedures grant no permissions. Scripts, reference expansion, installation, and
+skill editing are unsupported. Synthetic examples can be selected with
+`--skills-dir ./examples/skills --workspace ./examples/workspace`.
 
-```sh
-mkdir -m 700 ./demo-memory
-printf '%s\n' 'Remember label=amber using memory_set.' |
-  cargo run -- --memory-dir ./demo-memory
-printf '%s\n' 'Use memory_list and tell me the saved label.' |
-  cargo run -- --memory-dir ./demo-memory
-```
+## Memory and conversation state
 
-Memory and conversation saving are independent. Mutations validate the proposed
-state before staging a file in the same directory, synchronizing it, and publishing
-atomically (no-clobber for initial creation). Files use 0600 permissions on Unix.
-Only publication updates the runtime state and permits tool success. Earlier
-failures preserve the prior state and return a correlated tool error; the runtime
-does not retry. A successful write survives later model, stdout, or checkpoint
-failure, even when the previous checkpoint remains unchanged. The parent directory
-is not synchronized, so power-loss durability is not guaranteed; crashes may leave
-temporary files. One writer only: concurrent writers, directory replacement, and
-external edits while running are unsupported.
+`--memory-dir PATH` independently enables `memory_list({})`,
+`memory_set({key, value})`, and `memory_delete({key})` for one fixed `memory.json`
+in an existing trusted directory. Startup validates and loads it once. Missing
+means empty; malformed, duplicate-key, oversized, symlink, and non-regular stores
+fail locally. Entries enter context through tool results. Setting an unchanged
+value or deleting an absent key is a successful no-op. Memory is plaintext;
+deleting a fact does not erase copies in historical conversations.
 
-Memory is **plaintext**, not a secrets vault. Tool results are printed, saved in
-checkpoints, and may be sent to Anthropic. Deleting memory does not erase historical
-copies in checkpoints. Resume preserves saved system/history exactly, requires
-`--memory-dir` again for current access, and never replays historical writes.
-Fresh sessions retrieve facts without importing old conversation history.
+Completed turns save under `$HOME/.hermes-kernel-lab/sessions/`; HOME must be an
+existing absolute directory. The resume path prints after the first save.
+`--resume-session PATH` restores validated system text and ordered history,
+including correlated tool results. Historical tools are never replayed. Workspace,
+write, shell, skill, and memory authority must be supplied again for current access;
+saved history grants none. Skill snapshots are rebuilt for the new invocation.
 
-Learning exercise: run the demo, forget the label in a third process using
-`memory_delete`, then inspect an older checkpoint. Explain why a fresh listing is
-empty while the old conversation can still contain the label.
+Saving follows successful answer output and flushing. Turn/save failures stop the
+program and preserve the previous checkpoint; saving can fail after an answer has
+been displayed. No completed new turn means no checkpoint update. Checkpoints
+must be trusted and contain plaintext conversation and tool output, without secret
+redaction.
 
-## Save and resume
+Native workspace writes, memory, and checkpoints synchronize a staged file and
+publish atomically. New destinations refuse clobbering; Unix files use 0600.
+The parent directory is not synchronized, so power-loss durability is not guaranteed,
+and crashes may leave temporary files. One writer is assumed. Published writes and
+command effects survive later model, output, or checkpoint failures: there is no
+turn-level rollback or automatic command retry.
 
-Completed turns save automatically under `$HOME/.hermes-kernel-lab/sessions/`.
-`HOME` must name an existing absolute directory. The resume path is printed after
-the first successful save in each invocation; later turns update that file silently.
-
-```sh
-# First process:
-printf '%s\n' 'Remember the label amber.' | cargo run --
-
-# Second process: substitute the printed checkpoint path.
-printf '%s\n' 'What label did I give you?' | \
-  cargo run -- --resume-session /path/to/checkpoint.json
-```
-
-Resume restores the exact saved system instructions and complete ordered history,
-including tool calls and results. It validates the version, provider/model, message
-structure, matching tool results, and completed-turn boundary before any model
-request. Historical tools are never replayed. Instruction files are not reloaded,
-and `--instructions` cannot be combined with `--resume-session`.
-
-Credentials and workspace access come from the current invocation. Supply
-`--workspace` again to enable file tools; without it, saved instructions and file
-results remain in history, but new workspace access is disabled. The checkpoint
-path is independent of the workspace and does not authorize file access.
-
-Likewise, supply `--skills-dir` again to enable new skill reads. Without it,
-previous skill results remain in history but both skill tools are disabled.
-With it, startup rebuilds the catalog from current files. Resume preserves the
-saved system text exactly, including text from sessions predating skills; it does
-not inject new guidance or replay historical loads. The checkpoint stores no
-skill directory or catalog and grants no skill access.
-
-Checkpoints are **plaintext and must be trusted**. They contain conversation text
-and may contain file contents or secrets included in that text. Credentials and
-workspace permissions are not stored; transcript secrets are not redacted.
-
-Saving happens only after a completed turn and successful stdout writes and flushes.
-Turn or save failures preserve the previous checkpoint and stop the process; a save
-failure can occur after the answer is displayed. Exiting without a completed new
-turn does not create or update a checkpoint.
-
-Writes use a synchronized temporary file in the same directory and atomic
-publication. New destinations refuse overwrite; resume requires an existing
-regular file and rejects symlinks. Newly created directories use 0700 permissions
-and checkpoint files use 0600 on Unix. Existing directories must be trusted.
-The parent directory is not synchronized, so publication is not guaranteed to
-survive power loss. Crashes may leave temporary files. Concurrent writers,
-automatic repair, and mid-turn recovery are unsupported.
-
-## Limits and failures
+## Limits and checks
 
 | Resource | Limit |
 | --- | --- |
-| Model calls per user turn | 8, with one tool call per response |
-| User message | 16 KiB |
-| Workspace or instruction file | 32 KiB |
+| Model calls per user turn | 8, one tool call per response |
+| User message / shell command | 16 KiB each |
 | Directory listing | 200 examined entries; 32 KiB serialized output |
-| Skill root enumeration | Same directory limits, including ignored entries in the count |
-| Skills catalog | 20 skills; 32 KiB per complete document; 32 KiB serialized metadata listing |
-| Model request / response | 1 MiB each |
+| Skills | 20 documents; 32 KiB each; 32 KiB metadata listing; ordinary root enumeration limits |
 | Memory | 32 entries; 64-byte keys; 1 KiB values; 32 KiB serialized file |
+| Model request / response | 1 MiB each |
 | Checkpoint | 2 MiB |
 | Model output / HTTP timeout | 512 tokens / 60 seconds per request |
 
-Invalid tool arguments (including non-object inputs), unknown names, and disabled
-tools return correlated tool errors to the model. Protocol, transport, budget, and output
-failures stop the program. A tool request on the eighth model call fails before
-execution. Each user turn gets a fresh call budget, including after resume.
-
-Every request includes the full history. There is no streaming, retrying,
-truncation, or compression; a valid checkpoint can exceed the next request’s
-size limit. Longer conversations consume more input tokens.
-
-## Checks
+Invalid arguments, disabled tools, and unknown names return correlated tool errors.
+Command exit failure is represented by its exit code/signal. Protocol, transport,
+budget, and output failures stop the program. Invalid
+or truncated responses never execute tools; a tool request on call eight fails
+before execution. Every turn gets a fresh budget, including after resume.
+Full history accompanies every request, without streaming, retries, compression,
+or history truncation. A valid checkpoint can exceed the next request limit.
 
 ```sh
 cargo fmt --check
@@ -256,9 +205,9 @@ cargo test --offline
 cargo clippy --offline --all-targets -- -D warnings
 ```
 
-Tests use synthetic data, scripted model responses, and temporary files; they
-require no credentials or live model requests. Live-provider integration is not
-covered by these checks. Skill tests verify metadata/body separation, bounded
-snapshots, argument and filesystem failures, actual request histories through
-list → view → workspace read → answer, and save/resume authorization. They verify
-orchestration, not whether a live model follows a procedure correctly.
+Tests use synthetic responses and temporary files without credentials or external
+network access. On macOS they exercise real Seatbelt, bash, network denial,
+timeout/descendant cleanup, Ctrl-C, and one compiled offline workflow. The host must allow
+Seatbelt initialization; nested sandbox restrictions can prevent these tests from
+running. Other platforms do not run the macOS enforcement tests. Live-provider
+behavior and whether a model follows skill procedures are not covered.

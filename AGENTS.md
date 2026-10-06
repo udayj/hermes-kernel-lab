@@ -8,6 +8,13 @@ or an architecture to translate. Focus explanations on agent mechanisms, state, 
 Success means the owner can explain the current system and why it is shaped
 this way. Prefer a small, understandable implementation over faster coverage.
 
+## Threat model
+The operator and their selected checkpoint, memory, skills, `.env`, and offline
+script inputs are trusted. Model output is untrusted: tool arguments, shell
+commands, and workspace contents that the model can write. The operator keeps
+trusted inputs outside the writable workspace. Workspace dotfiles are hidden
+and `AGENTS.md` is not writable; shell scratch is the dotfile exception.
+
 ## Scope and authorization
 - Work on one explicitly approved step at a time. A roadmap, suggestion, or
   possible next step is not authorization to implement it.
@@ -18,7 +25,7 @@ this way. Prefer a small, understandable implementation over faster coverage.
   capabilities, unused extension points, placeholder modules, or unrelated cleanup.
 - If a necessary prerequisite or new risk materially expands the step, explain
   it and propose a smaller or revised scope rather than silently building ahead.
-- Do not merge, begin the next step, or delegate parallel implementation unless
+- Do not merge, commit, begin the next step, or delegate parallel implementation unless
   explicitly requested. Do not change these instructions without approval.
 
 ## Design

@@ -57,7 +57,8 @@ fn cli_validates_before_credentials_and_no_turn_exits_never_write() {
         assert_eq!(read(&path).unwrap(), saved);
     }
     // Resume must not attempt to load even an invalid root instruction file.
-    write(directory.path().join("AGENTS.md"), [0xff]).unwrap();
+    create_dir_all(directory.path().join("workspace")).unwrap();
+    write(directory.path().join("workspace/AGENTS.md"), [0xff]).unwrap();
     create_dir_all(directory.path().join("skills/sample")).unwrap();
     write(
         directory.path().join("skills/sample/SKILL.md"),
@@ -71,11 +72,16 @@ fn cli_validates_before_credentials_and_no_turn_exits_never_write() {
             "",
         ),
         (
-            vec!["--resume-session", "saved.json", "--workspace", "."],
+            vec!["--resume-session", "saved.json", "--workspace", "workspace"],
             "\n/exit\n",
         ),
     ] {
-        assert!(invoke(&args, input).status.success());
+        let output = invoke(&args, input);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
         assert_eq!(read(&path).unwrap(), saved);
     }
     write(directory.path().join("skills/sample/SKILL.md"), "invalid").unwrap();

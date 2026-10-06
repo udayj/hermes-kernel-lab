@@ -175,7 +175,7 @@ fn build_request(
         .map_err(|_| "could not construct the HTTP request".into())
 }
 
-fn encode_request(
+pub(crate) fn encode_request(
     system: &str,
     messages: &[Message],
     tools: &[ToolDefinition],
@@ -215,7 +215,7 @@ fn check_status(status: u16) -> Result<(), String> {
     Err(format!("Anthropic HTTP {status}: {explanation}"))
 }
 
-fn decode_response(body: &[u8]) -> Result<AssistantResponse, String> {
+pub(crate) fn decode_response(body: &[u8]) -> Result<AssistantResponse, String> {
     let response: MessageResponse = from_slice(body)
         .map_err(|_| "Anthropic returned invalid JSON or an unexpected message schema")?;
     if response.kind != "message" || response.role != "assistant" {

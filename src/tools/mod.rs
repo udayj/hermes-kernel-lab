@@ -1,9 +1,13 @@
 mod memory;
+#[cfg(target_os = "macos")]
+mod process;
+#[cfg(target_os = "macos")]
+mod sandbox;
 mod skills;
 mod workspace;
 
-use self::{skills::Skills, workspace::ReadOnlyDirectory};
-use serde::Serialize;
+use self::{skills::Skills, workspace::Workspace};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json, to_string};
 use std::{
     env::consts::{ARCH, OS},
@@ -45,7 +49,9 @@ impl ToolOutcome {
 }
 
 pub struct ToolCatalog {
-    workspace: Option<ReadOnlyDirectory>,
+    workspace: Option<Workspace>,
+    #[cfg(target_os = "macos")]
+    runner: Option<process::Runner>,
     skills: Option<Skills>,
     memory: Option<memory::Memory>,
 }
@@ -56,11 +62,13 @@ impl ToolCatalog {
         skills_dir: Option<&Path>,
         memory_dir: Option<&Path>,
     ) -> Result<Self, String> {
-        let workspace = workspace.map(ReadOnlyDirectory::open).transpose()?;
+        let workspace = workspace.map(Workspace::open).transpose()?;
         let skills = skills_dir.map(Skills::open).transpose()?;
         let memory = memory_dir.map(memory::Memory::open).transpose()?;
         Ok(Self {
             workspace,
+            #[cfg(target_os = "macos")]
+            runner: None,
             skills,
             memory,
         })
@@ -70,9 +78,37 @@ impl ToolCatalog {
     pub fn without_workspace() -> Self {
         Self {
             workspace: None,
+            #[cfg(target_os = "macos")]
+            runner: None,
             skills: None,
             memory: None,
         }
+    }
+
+    pub fn configure(&mut self, writes: bool, shell: bool) -> Result<(), String> {
+        let Some(workspace) = &mut self.workspace else {
+            if writes || shell {
+                return Err("workspace consent requires --workspace".into());
+            }
+            return Ok(());
+        };
+        workspace.writable = writes;
+        #[cfg(target_os = "macos")]
+        {
+            self.runner = if shell {
+                Some(process::Runner::open(sandbox::Sandbox::new(
+                    &workspace.root,
+                    writes,
+                )?)?)
+            } else {
+                None
+            };
+        }
+        #[cfg(not(target_os = "macos"))]
+        if shell {
+            return Err("shell execution requires macOS Seatbelt".into());
+        }
+        Ok(())
     }
 
     pub fn default_instructions(&self) -> Result<Option<String>, String> {
@@ -91,7 +127,7 @@ impl ToolCatalog {
             .to_str()
             .ok_or("instruction path must be valid Unicode")?;
         workspace
-            .read(path)
+            .instructions(path)
             .map_err(|error| format!("could not load instructions: {error}"))
     }
 
@@ -100,6 +136,14 @@ impl ToolCatalog {
         if self.workspace.is_some() {
             definitions.push(list_definition());
             definitions.push(read_definition());
+            if self.workspace.as_ref().is_some_and(|w| w.writable) {
+                definitions.push(ToolDefinition { name: "write_file", description: "Atomically publish UTF-8 text in an existing workspace parent. Existing destinations require explicit overwrite=true. Effects survive later turn failures.", input_schema: json!({"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"},"overwrite":{"type":"boolean","default":false}},"required":["path","content"],"additionalProperties":false}) });
+                definitions.push(ToolDefinition { name: "patch", description: "Replace exactly one occurrence of old_text with new_text, atomically. Missing, empty, or ambiguous old_text is an error without mutation.", input_schema: json!({"type":"object","properties":{"path":{"type":"string"},"old_text":{"type":"string"},"new_text":{"type":"string"}},"required":["path","old_text","new_text"],"additionalProperties":false}) });
+            }
+            #[cfg(target_os = "macos")]
+            if self.runner.is_some() {
+                definitions.push(ToolDefinition { name: "bash", description: "Run a foreground sandboxed bash without startup files or stdin. Use grep for search. Returns bounded output, exit code or signal, timeout and truncation flags.", input_schema: string_schema("command") });
+            }
         }
         if self.skills.is_some() {
             definitions.push(ToolDefinition {
@@ -158,8 +202,16 @@ impl ToolCatalog {
                 .as_ref()
                 .ok_or_else(|| "read_file is disabled; no workspace was authorized".into())
                 .and_then(|workspace| {
-                    exact_string(input, "path").and_then(|path| workspace.read(&path))
+                    let args: ReadArgs = arguments(input)?;
+                    match (args.start_line, args.end_line) {
+                        (None, None) => workspace.read(&args.path),
+                        (Some(start), Some(end)) => workspace.read_lines(&args.path, start, end),
+                        _ => Err("start_line and end_line must be supplied together".into()),
+                    }
                 }),
+            "write_file" | "patch" => self.mutate(name, input),
+            #[cfg(target_os = "macos")]
+            "bash" => self.bash(input),
             "skills_list" | "skill_view" => self
                 .skills
                 .as_ref()
@@ -211,6 +263,30 @@ impl ToolCatalog {
             Err(error) => ToolOutcome::error(error),
         }
     }
+
+    fn mutate(&self, name: &str, input: &Value) -> Result<String, String> {
+        let workspace = self
+            .workspace
+            .as_ref()
+            .ok_or("workspace tools are disabled")?;
+        if !workspace.writable {
+            return Err("workspace writes are disabled".into());
+        }
+        if name == "write_file" {
+            let args: WriteArgs = arguments(input)?;
+            workspace.write(&args.path, &args.content, args.overwrite)
+        } else {
+            let args: PatchArgs = arguments(input)?;
+            workspace.patch(&args.path, &args.old_text, &args.new_text)
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn bash(&self, input: &Value) -> Result<String, String> {
+        let runner = self.runner.as_ref().ok_or("sandbox runner is disabled")?;
+        let command = exact_string(input, "command")?;
+        to_string(&runner.bash(command)?).map_err(|_| "could not encode command result".into())
+    }
 }
 
 fn runtime_definition() -> ToolDefinition {
@@ -232,8 +308,8 @@ fn list_definition() -> ToolDefinition {
 fn read_definition() -> ToolDefinition {
     ToolDefinition {
         name: READ_TOOL,
-        description: "Read one authorized workspace-relative regular UTF-8 text file, up to 32 KiB, preserving its contents.",
-        input_schema: string_schema("path"),
+        description: "Read a regular UTF-8 workspace file, up to 32 KiB. Supply one-based start_line and end_line together for larger files, with an 8 MiB scan bound and 1,000-line range limit.",
+        input_schema: json!({"type":"object","properties":{"path":{"type":"string"},"start_line":{"type":"integer","minimum":1},"end_line":{"type":"integer","minimum":1}},"required":["path"],"additionalProperties":false}),
     }
 }
 
@@ -273,6 +349,38 @@ fn exact_string(input: &Value, field: &str) -> Result<String, String> {
         .ok_or_else(|| format!("{field} must be a string"))
 }
 
+fn arguments<T: serde::de::DeserializeOwned>(input: &Value) -> Result<T, String> {
+    if !input.is_object() {
+        return Err("tool input must be a JSON object".into());
+    }
+    if input.as_object().unwrap().values().any(Value::is_null) {
+        return Err("optional argument fields must be omitted, not null".into());
+    }
+    serde_json::from_value(input.clone())
+        .map_err(|_| "invalid tool argument fields or types".into())
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReadArgs {
+    path: String,
+    start_line: Option<usize>,
+    end_line: Option<usize>,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WriteArgs {
+    path: String,
+    content: String,
+    #[serde(default)]
+    overwrite: bool,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PatchArgs {
+    path: String,
+    old_text: String,
+    new_text: String,
+}
 #[derive(Serialize)]
 struct RuntimeInfo {
     target_os: &'static str,
@@ -542,6 +650,7 @@ mod tests {
         assert!(execute(&mut disabled, LIST_TOOL, json!({"path":"."})).is_error);
 
         let (_temporary, mut enabled) = workspace();
+        enabled.configure(false, false).unwrap();
         let names = enabled
             .definitions()
             .iter()

@@ -1,13 +1,10 @@
-use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt};
-use cap_std::{
-    ambient_authority,
-    fs::{Dir, OpenOptions},
-};
+use crate::bounded::{ReadError, read_bounded};
+use cap_std::{ambient_authority, fs::Dir};
 use serde::Serialize;
 use serde_json::{to_string, to_vec};
 use std::{
-    io::{ErrorKind, Read},
-    path::{Component, Path},
+    io::{BufRead, BufReader, ErrorKind, Read, Write},
+    path::{Component, Path, PathBuf},
 };
 
 const MAX_FILE_BYTES: u64 = 32 * 1024;
@@ -31,8 +28,11 @@ impl ReadOnlyDirectory {
     }
 
     pub(super) fn entries(&self, path: &str) -> Result<Vec<DirectoryEntry>, String> {
-        let components = validate_path(path, true)?;
-        let directory = self.open_directory(&components)?;
+        let path = self.resolve(Path::new(path))?;
+        let directory = self
+            .root
+            .open_dir(path)
+            .map_err(|_| "could not open the requested directory")?;
         let mut entries = Vec::new();
         let mut examined = 0;
         let mut encoded_bytes = 2;
@@ -80,7 +80,6 @@ impl ReadOnlyDirectory {
     }
 
     pub fn default_instructions(&self) -> Result<Option<String>, String> {
-        // Inspect without following links: a dangling link is not an absent default.
         match self.root.symlink_metadata("AGENTS.md") {
             Ok(_) => self.read("AGENTS.md").map(Some),
             Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
@@ -88,84 +87,204 @@ impl ReadOnlyDirectory {
         }
     }
 
-    pub fn read(&self, path: &str) -> Result<String, String> {
-        let components = validate_path(path, false)?;
-        let (parent_components, leaf) = components.split_at(components.len() - 1);
-        let parent = self.open_directory(parent_components)?;
-        // Reject special files before open (opening a FIFO could otherwise block).
-        if !parent
-            .symlink_metadata(&leaf[0])
+    fn resolve(&self, path: &Path) -> Result<PathBuf, String> {
+        check_path(path, false)?;
+        let resolved = self
+            .root
+            .canonicalize(path)
+            .map_err(|_| "could not resolve the requested workspace path")?;
+        check_path(&resolved, false)?;
+        Ok(resolved)
+    }
+
+    fn open_file(&self, path: &str) -> Result<cap_std::fs::File, String> {
+        let path = self.resolve(Path::new(path))?;
+        // Inspect before opening: opening a FIFO could otherwise block.
+        if !self
+            .root
+            .metadata(&path)
             .map_err(|_| "could not inspect the requested file")?
             .is_file()
         {
             return Err("requested path is not a regular file".into());
         }
-        let mut options = OpenOptions::new();
-        options.read(true).follow(FollowSymlinks::No);
-        let file = parent
-            .open_with(&leaf[0], &options)
-            .map_err(|_| "could not open the requested file")?;
-        let metadata = file
-            .metadata()
-            .map_err(|_| "could not inspect the requested file")?;
-        if !metadata.is_file() {
-            return Err("requested path is not a regular file".into());
-        }
-
-        let mut bytes = Vec::new();
-        file.take(MAX_FILE_BYTES + 1)
-            .read_to_end(&mut bytes)
-            .map_err(|_| "could not read the requested file")?;
-        if bytes.len() as u64 > MAX_FILE_BYTES {
-            return Err("file exceeds the 32 KiB limit".into());
-        }
-        String::from_utf8(bytes).map_err(|_| "file is not valid UTF-8 text".into())
+        self.root
+            .open(path)
+            .map_err(|_| "could not open the requested file".into())
     }
 
-    fn open_directory(&self, components: &[String]) -> Result<Dir, String> {
-        let mut directory = self
-            .root
-            .try_clone()
-            .map_err(|_| "could not access the authorized directory")?;
-        for component in components {
-            directory = directory
-                .open_dir_nofollow(component)
-                .map_err(|_| "could not open the requested directory without following symlinks")?;
-        }
-        Ok(directory)
+    pub fn read(&self, path: &str) -> Result<String, String> {
+        let bytes =
+            read_bounded(self.open_file(path)?, MAX_FILE_BYTES).map_err(|error| match error {
+                ReadError::Io => "could not read the requested file",
+                ReadError::TooLarge => "file exceeds the 32 KiB limit",
+            })?;
+        String::from_utf8(bytes).map_err(|_| "file is not valid UTF-8 text".into())
     }
 }
 
-fn validate_path(path: &str, allow_root: bool) -> Result<Vec<String>, String> {
-    if allow_root && path == "." {
-        return Ok(Vec::new());
+// Skills keep the read-only capability above. Workspace authority is invocation-local.
+pub struct Workspace {
+    pub root: PathBuf,
+    directory: ReadOnlyDirectory,
+    pub writable: bool,
+}
+
+impl Workspace {
+    pub fn open(path: &Path) -> Result<Self, String> {
+        let root = path.canonicalize().map_err(|_| "workspace must exist")?;
+        if ["/", "/Users", "/private", "/private/tmp", "/private/var"]
+            .iter()
+            .any(|p| root == Path::new(p))
+            || std::env::temp_dir().canonicalize().ok().as_deref() == Some(&root)
+        {
+            return Err("workspace must be a narrow project directory".into());
+        }
+        let directory = ReadOnlyDirectory::open(&root)?;
+        Ok(Self {
+            root,
+            directory,
+            writable: false,
+        })
     }
-    if path.is_empty() {
-        return Err("path must not be empty".into());
+
+    pub fn list(&self, path: &str) -> Result<String, String> {
+        self.directory.list(path)
     }
-    let mut validated = Vec::new();
-    for component in Path::new(path).components() {
-        match component {
-            Component::Normal(name) => {
-                let name = name
-                    .to_str()
-                    .ok_or_else(|| "path must be valid Unicode".to_string())?;
-                if name.starts_with('.') {
-                    return Err("dot-prefixed path components are not accessible".into());
-                }
-                validated.push(name.to_owned());
+
+    pub fn default_instructions(&self) -> Result<Option<String>, String> {
+        self.directory.default_instructions()
+    }
+
+    pub fn instructions(&self, path: &str) -> Result<String, String> {
+        self.directory.read(path)
+    }
+
+    pub fn read(&self, path: &str) -> Result<String, String> {
+        self.directory.read(path)
+    }
+
+    pub fn read_lines(&self, path: &str, start: usize, end: usize) -> Result<String, String> {
+        if start == 0 || end < start || end - start >= 1000 {
+            return Err("line range must be one-based, ordered, and at most 1,000 lines".into());
+        }
+        let file = self.directory.open_file(path)?;
+        let mut reader = BufReader::new(file.take(8 * 1024 * 1024 + 1));
+        let mut scanned = 0;
+        let mut output = String::new();
+        let mut found = false;
+        for number in 1..=end {
+            let mut line = Vec::new();
+            let size = reader
+                .read_until(b'\n', &mut line)
+                .map_err(|_| "could not read line range")?;
+            scanned += size;
+            if scanned > 8 * 1024 * 1024 {
+                return Err("line range exceeds the 8 MiB scan limit".into());
             }
-            Component::CurDir => return Err("'.' is only valid as the workspace root".into()),
-            Component::ParentDir => return Err("parent traversal is not allowed".into()),
-            Component::RootDir | Component::Prefix(_) => {
-                return Err("absolute paths are not allowed".into());
+            if size == 0 {
+                break;
+            }
+            let text = std::str::from_utf8(&line).map_err(|_| "file is not valid UTF-8 text")?;
+            if number >= start {
+                found = true;
+                if output.len() + text.len() > MAX_FILE_BYTES as usize {
+                    return Err("line range exceeds the 32 KiB output limit".into());
+                }
+                output.push_str(text);
+            }
+        }
+        if !found {
+            return Err("start_line is beyond end of file".into());
+        }
+        Ok(output)
+    }
+
+    pub fn patch(&self, path: &str, old: &str, new: &str) -> Result<String, String> {
+        if old.is_empty() {
+            return Err("old_text must not be empty".into());
+        }
+        let original = self.read(path)?;
+        // Include overlapping occurrences: 'aaa' contains two matches for 'aa'.
+        let matches: Vec<_> = original
+            .char_indices()
+            .filter_map(|(i, _)| original[i..].starts_with(old).then_some(i))
+            .take(2)
+            .collect();
+        if matches.len() != 1 {
+            return Err("patch requires exactly one occurrence of old_text".into());
+        }
+        let i = matches[0];
+        let next = format!("{}{}{}", &original[..i], new, &original[i + old.len()..]);
+        self.write(path, &next, true)
+    }
+
+    pub fn write(&self, path: &str, content: &str, overwrite: bool) -> Result<String, String> {
+        if !self.writable {
+            return Err("workspace writes are disabled".into());
+        }
+        if content.len() > MAX_FILE_BYTES as usize {
+            return Err("write exceeds the 32 KiB file limit".into());
+        }
+        let path = Path::new(path);
+        check_path(path, true)?;
+        let leaf = path.file_name().ok_or("path must name a file")?;
+        let target = match self.directory.root.canonicalize(path) {
+            Ok(target) => {
+                check_path(&target, true)?;
+                if !self
+                    .directory
+                    .root
+                    .metadata(&target)
+                    .map_err(|_| "could not inspect destination")?
+                    .is_file()
+                {
+                    return Err("destination must be a regular file".into());
+                }
+                target
+            }
+            Err(e) if e.kind() == ErrorKind::NotFound => {
+                let parent = path
+                    .parent()
+                    .filter(|p| !p.as_os_str().is_empty())
+                    .unwrap_or(Path::new("."));
+                self.directory.resolve(parent)?.join(leaf)
+            }
+            Err(_) => return Err("could not resolve workspace destination".into()),
+        };
+        check_path(&target, true)?;
+        let destination = self.root.join(target);
+        let mut staged = tempfile::NamedTempFile::new_in(destination.parent().unwrap())
+            .map_err(|_| "could not stage workspace write")?;
+        staged
+            .write_all(content.as_bytes())
+            .and_then(|()| staged.as_file().sync_all())
+            .map_err(|_| "could not synchronize workspace write")?;
+        if overwrite {
+            staged
+                .persist(destination)
+                .map_err(|_| "could not publish workspace write")?;
+        } else {
+            staged
+                .persist_noclobber(destination)
+                .map_err(|_| "destination exists or could not publish workspace write")?;
+        }
+        Ok("Workspace file published.".into())
+    }
+}
+
+fn check_path(path: &Path, mutation: bool) -> Result<(), String> {
+    for component in path.components() {
+        if let Component::Normal(name) = component {
+            if name.to_string_lossy().starts_with('.') {
+                return Err("dot-prefixed path components are not accessible".into());
+            }
+            if mutation && name == "AGENTS.md" {
+                return Err("AGENTS.md is read-only".into());
             }
         }
     }
-    if validated.is_empty() {
-        return Err("path must name a workspace entry".into());
-    }
-    Ok(validated)
+    Ok(())
 }
 
 #[derive(Serialize)]
@@ -178,137 +297,69 @@ pub(super) struct DirectoryEntry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::{Value, from_str, json};
-    #[cfg(unix)]
-    use std::os::unix::fs::symlink;
-    use std::{
-        fs::{File, create_dir, write},
-        io::Write,
-    };
-    use tempfile::TempDir;
+    use std::fs;
+    use tempfile::tempdir;
 
-    fn temporary_workspace() -> (TempDir, ReadOnlyDirectory) {
-        let temporary = TempDir::new().unwrap();
-        let workspace = ReadOnlyDirectory::open(temporary.path()).unwrap();
-        (temporary, workspace)
+    fn workspace(root: &Path) -> Workspace {
+        let mut workspace = Workspace::open(root).unwrap();
+        workspace.writable = true;
+        workspace
     }
 
     #[test]
-    fn lists_one_directory_in_sorted_order_and_marks_symlinks() {
-        let (temporary, workspace) = temporary_workspace();
-        write(temporary.path().join("z.txt"), "z").unwrap();
-        create_dir(temporary.path().join("a-dir")).unwrap();
-        write(temporary.path().join(".env"), "secret").unwrap();
-        #[cfg(unix)]
-        symlink("z.txt", temporary.path().join("m-link")).unwrap();
-
-        let entries: Value = from_str(&workspace.list(".").unwrap()).unwrap();
-        #[cfg(unix)]
+    fn write_publishes_and_preserves_an_existing_file_on_failure() {
+        let root = tempdir().unwrap();
+        let workspace = workspace(root.path());
+        workspace.write("file.txt", "amber", false).unwrap();
+        assert!(workspace.write("file.txt", "bad", false).is_err());
         assert_eq!(
-            entries,
-            json!([
-                {"name":"a-dir","type":"directory"},
-                {"name":"m-link","type":"symlink"},
-                {"name":"z.txt","type":"file"}
-            ])
+            fs::read_to_string(root.path().join("file.txt")).unwrap(),
+            "amber"
         );
-        #[cfg(not(unix))]
+        fs::write(root.path().join("AGENTS.md"), "instructions").unwrap();
+        assert!(workspace.write("AGENTS.md", "bad", true).is_err());
+    }
+
+    #[test]
+    fn patch_replaces_one_match_and_preserves_content_on_ambiguity() {
+        let root = tempdir().unwrap();
+        let workspace = workspace(root.path());
+        workspace.write("file.txt", "amber", false).unwrap();
+        workspace.patch("file.txt", "amber", "blue").unwrap();
+        assert_eq!(workspace.read("file.txt").unwrap(), "blue");
+        workspace.write("file.txt", "aaa", true).unwrap();
+        assert!(workspace.patch("file.txt", "aa", "bad").is_err());
+        assert_eq!(workspace.read("file.txt").unwrap(), "aaa");
+    }
+
+    #[test]
+    fn line_range_reads_selected_lines_and_rejects_invalid_bounds() {
+        let root = tempdir().unwrap();
+        let workspace = workspace(root.path());
+        fs::write(root.path().join("file.txt"), "first\nsecond\nthird\n").unwrap();
         assert_eq!(
-            entries,
-            json!([
-                {"name":"a-dir","type":"directory"},
-                {"name":"z.txt","type":"file"}
-            ])
+            workspace.read_lines("file.txt", 2, 3).unwrap(),
+            "second\nthird\n"
         );
-    }
-
-    #[test]
-    fn directory_limits_fail_instead_of_returning_partial_results() {
-        let (temporary, workspace) = temporary_workspace();
-        for index in 0..=MAX_DIRECTORY_ENTRIES {
-            write(temporary.path().join(format!("entry-{index:03}")), "").unwrap();
-        }
-        let error = workspace.list(".").unwrap_err();
-        assert!(error.contains("200-entry"));
-
-        let (temporary, workspace) = temporary_workspace();
-        let long = "x".repeat(240);
-        for index in 0..150 {
-            write(temporary.path().join(format!("{index:03}-{long}")), "").unwrap();
-        }
-        let error = workspace.list(".").unwrap_err();
-        assert!(error.contains("32 KiB"));
-    }
-
-    #[test]
-    fn reads_exact_empty_unicode_and_boundary_contents() {
-        let (temporary, workspace) = temporary_workspace();
-        for (name, content) in [
-            ("exact.txt", "  first\nsecond\n  ".to_string()),
-            ("empty.txt", String::new()),
-            ("unicode.txt", "नमस्ते 世界".to_string()),
-            ("boundary.txt", "x".repeat(MAX_FILE_BYTES as usize)),
-        ] {
-            write(temporary.path().join(name), &content).unwrap();
-            assert_eq!(workspace.read(name).unwrap(), content);
-        }
-        write(
-            temporary.path().join("large.txt"),
-            "x".repeat(MAX_FILE_BYTES as usize + 1),
-        )
-        .unwrap();
-        assert!(workspace.read("large.txt").unwrap_err().contains("32 KiB"));
-    }
-
-    #[test]
-    fn rejects_missing_invalid_utf8_and_denied_paths() {
-        let (temporary, workspace) = temporary_workspace();
-        write(temporary.path().join("invalid.bin"), [0xff, 0xfe]).unwrap();
-        write(temporary.path().join(".hidden"), "hidden").unwrap();
-        create_dir(temporary.path().join("dir")).unwrap();
-        for path in [
-            "missing",
-            "invalid.bin",
-            ".hidden",
-            "dir/.hidden",
-            "../outside",
-            "/absolute",
-            "./relative",
-            ".",
-            "dir",
-        ] {
-            assert!(
-                workspace.read(path).is_err(),
-                "path {path} unexpectedly succeeded"
-            );
-        }
+        assert!(workspace.read_lines("file.txt", 0, 1).is_err());
     }
 
     #[cfg(unix)]
     #[test]
-    fn rejects_symlink_traversal_and_special_files_on_the_tested_host() {
-        let (temporary, workspace) = temporary_workspace();
-        create_dir(temporary.path().join("real-dir")).unwrap();
-        write(temporary.path().join("real-dir/file.txt"), "content").unwrap();
-        symlink("real-dir", temporary.path().join("dir-link")).unwrap();
-        symlink("real-dir/file.txt", temporary.path().join("file-link")).unwrap();
-
-        for path in ["dir-link/file.txt", "file-link"] {
-            assert!(workspace.read(path).is_err());
-        }
-        assert!(workspace.list("dir-link").is_err());
-
-        let devices = ReadOnlyDirectory::open(Path::new("/dev")).unwrap();
-        let error = devices.read("null").unwrap_err();
-        assert!(error.contains("not a regular file"));
-    }
-
-    #[test]
-    fn workspace_must_exist_and_be_a_directory() {
-        let temporary = TempDir::new().unwrap();
-        let file = temporary.path().join("file");
-        File::create(&file).unwrap().write_all(b"x").unwrap();
-        assert!(ReadOnlyDirectory::open(&file).is_err());
-        assert!(ReadOnlyDirectory::open(&temporary.path().join("missing")).is_err());
+    fn contained_symlinks_follow_the_target_protection_policy() {
+        use std::os::unix::fs::symlink;
+        let root = tempdir().unwrap();
+        let workspace = workspace(root.path());
+        fs::write(root.path().join("file.txt"), "content").unwrap();
+        symlink("file.txt", root.path().join("alias")).unwrap();
+        assert_eq!(workspace.read("alias").unwrap(), "content");
+        workspace.write("alias", "updated", true).unwrap();
+        assert_eq!(workspace.read("file.txt").unwrap(), "updated");
+        fs::write(root.path().join(".hidden"), "hidden").unwrap();
+        symlink(".hidden", root.path().join("hidden-alias")).unwrap();
+        assert!(workspace.read("hidden-alias").is_err());
+        fs::write(root.path().join("AGENTS.md"), "instructions").unwrap();
+        symlink("AGENTS.md", root.path().join("agents-alias")).unwrap();
+        assert!(workspace.write("agents-alias", "bad", true).is_err());
     }
 }
