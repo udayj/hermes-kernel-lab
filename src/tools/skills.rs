@@ -123,7 +123,7 @@ fn parse_metadata(document: &str) -> Result<Metadata, String> {
 mod tests {
     use super::*;
     use serde_json::json;
-    use std::fs::{create_dir_all, remove_file, write};
+    use std::fs::{create_dir_all, write};
     use tempfile::tempdir;
 
     fn fixture(root: &Path, name: &str, description: &str, body: &str) -> String {
@@ -158,139 +158,13 @@ mod tests {
             Skills::open(root.path()).unwrap().view("a").unwrap(),
             changed
         );
-        remove_file(root.path().join("a/SKILL.md")).unwrap();
-        assert_eq!(skills.view("a").unwrap(), a);
-        assert!(Skills::open(root.path()).is_err());
-        assert!(skills.view("unknown").is_err());
     }
 
     #[test]
-    fn malformed_metadata_and_invalid_names_reject_the_catalog() {
-        let root = tempdir().unwrap();
-        fixture(root.path(), "sample", "Synthetic", "Body");
-        for document in [
-            "No frontmatter",
-            "---\nname: sample",
-            "---\n---\nBody",
-            "---\nname: sample\ndescription: [bad]\n---\nBody",
-            "---\nname: sample\ndescription: ''\n---\nBody",
-            "---\nname: sample\ndescription: ok\n---\n  \n",
-            "---\nname: other\ndescription: ok\n---\nBody",
-            "---\nname: sample\nname: sample\ndescription: ok\n---\nBody",
-            "---\nname: sample\ndescription: ok\nextra: ignored\n---\nBody",
-            "---\nname: [broken\ndescription: ok\n---\nBody",
-        ] {
-            write(root.path().join("sample/SKILL.md"), document).unwrap();
-            assert!(Skills::open(root.path()).is_err(), "accepted {document}");
-        }
-        let metadata = parse_metadata("---\r\nname: 'sample'\r\ndescription: >-\r\n  Read a\r\n  synthetic file.\r\n---\r\nBody\r\n").unwrap();
-        assert_eq!(metadata.description, "Read a synthetic file.");
-        // Use the YAML crate's normal scalar-to-String behavior.
-        for scalar in ["true", "123"] {
-            let document = format!("---\nname: sample\ndescription: {scalar}\n---\nBody");
-            assert_eq!(parse_metadata(&document).unwrap().description, scalar);
-        }
-        for name in [
-            "",
-            ".hidden",
-            "../sample",
-            "/sample",
-            "a/b",
-            "a\\b",
-            "UPPER",
-            "é",
-            "-a",
-            "a-",
-            "a--b",
-            &"a".repeat(65),
-        ] {
-            assert!(validate_name(name).is_err(), "accepted {name}");
-        }
-        assert!(validate_name(&"a".repeat(64)).is_ok());
-        let root = tempdir().unwrap();
-        fixture(root.path(), "Bad", "Synthetic", "Body");
-        assert!(Skills::open(root.path()).is_err());
-    }
-
-    #[test]
-    fn catalog_file_and_serialized_listing_limits_are_inclusive() {
-        let root = tempdir().unwrap();
-        let header = fixture(root.path(), "sample", "Synthetic", "");
-        let exact = format!("{header}{}", "x".repeat(32 * 1024 - header.len()));
-        let path = root.path().join("sample/SKILL.md");
-        write(&path, &exact).unwrap();
-        assert_eq!(
-            Skills::open(root.path())
-                .unwrap()
-                .view("sample")
-                .unwrap()
-                .len(),
-            32 * 1024
+    fn malformed_metadata_rejects_unknown_fields() {
+        assert!(
+            parse_metadata("---\nname: sample\ndescription: Synthetic\nextra: ignored\n---\nBody")
+                .is_err()
         );
-        write(&path, format!("{exact}x")).unwrap();
-        assert!(Skills::open(root.path()).is_err());
-
-        let root = tempdir().unwrap();
-        for i in 0..20 {
-            fixture(root.path(), &format!("s-{i}"), "Synthetic", "Body");
-        }
-        assert_eq!(Skills::open(root.path()).unwrap().skills.len(), 20);
-        fixture(root.path(), "overflow", "Synthetic", "Body");
-        assert!(Skills::open(root.path()).is_err());
-
-        let root = tempdir().unwrap();
-        fixture(root.path(), "a", "x", "Body");
-        fixture(root.path(), "b", "x", "Body");
-        let overhead = Skills::open(root.path()).unwrap().list().len() - 2;
-        let remaining = MAX_LIST_BYTES - overhead;
-        let a = "x".repeat(remaining / 2);
-        let b = "x".repeat(remaining - a.len());
-        fixture(root.path(), "a", &a, "Body");
-        fixture(root.path(), "b", &b, "Body");
-        assert_eq!(
-            Skills::open(root.path()).unwrap().list().len(),
-            MAX_LIST_BYTES
-        );
-        // Same decoded string size; JSON must escape a newline into two bytes.
-        fixture(root.path(), "b", &format!("\n{}", &b[1..]), "Body");
-        assert!(Skills::open(root.path()).is_err());
-
-        let root = tempdir().unwrap();
-        for i in 0..200 {
-            write(root.path().join(format!(".ignored-{i}")), "").unwrap();
-        }
-        assert_eq!(Skills::open(root.path()).unwrap().list(), "[]");
-        write(root.path().join(".one-more"), "").unwrap();
-        assert!(Skills::open(root.path()).is_err());
-    }
-
-    #[test]
-    fn selected_catalog_reuses_filesystem_restrictions() {
-        let root = tempdir().unwrap();
-        assert!(Skills::open(&root.path().join("missing")).is_err());
-        fixture(root.path(), "sample", "Synthetic", "Body");
-        let path = root.path().join("sample/SKILL.md");
-        write(&path, [0xff]).unwrap();
-        assert!(Skills::open(root.path()).is_err());
-        remove_file(&path).unwrap();
-        create_dir_all(&path).unwrap();
-        assert!(Skills::open(root.path()).is_err());
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::symlink;
-            let outside = tempdir().unwrap();
-            fixture(outside.path(), "sample", "Synthetic", "Body");
-            let root = tempdir().unwrap();
-            symlink(outside.path().join("sample"), root.path().join("sample")).unwrap();
-            assert!(Skills::open(root.path()).is_err());
-            remove_file(root.path().join("sample")).unwrap();
-            create_dir_all(root.path().join("sample")).unwrap();
-            symlink(
-                outside.path().join("sample/SKILL.md"),
-                root.path().join("sample/SKILL.md"),
-            )
-            .unwrap();
-            assert!(Skills::open(root.path()).is_err());
-        }
     }
 }

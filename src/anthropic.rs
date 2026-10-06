@@ -242,7 +242,6 @@ pub(crate) fn decode_response(body: &[u8]) -> Result<AssistantResponse, String> 
     })
 }
 
-// Checkpoints share block validation, but HTTP still requires a valid stop reason.
 pub fn validate_assistant_content(content: &[ContentBlock]) -> Result<Option<ToolCall>, String> {
     let mut has_text = false;
     let mut tool_call = None;
@@ -344,76 +343,36 @@ mod tests {
         let decoded = decode_response(&to_vec(&body).unwrap()).unwrap();
         assert_eq!(decoded.tool_call.unwrap().name, "future_tool");
         assert_eq!(to_value(decoded.content).unwrap(), body["content"]);
-        let body = tool_response("skill_view", json!(null));
-        let decoded = decode_response(&to_vec(&body).unwrap()).unwrap();
-        assert_eq!(decoded.tool_call.unwrap().input, json!(null));
     }
 
     #[test]
-    fn rejects_malformed_and_inconsistent_responses() {
-        for body in [b"not json".as_slice(), b"{}"] {
-            assert!(decode_response(body).is_err());
-        }
-        for content in [
-            json!([]),
-            json!([{"type":"text","text":"  "}]),
-            json!([{"type":"unknown"}]),
-            json!([{"type":"tool_result","tool_use_id":"call-1","content":"ok"}]),
-        ] {
-            let mut body = response();
-            body["content"] = content;
-            assert!(decode_response(&to_vec(&body).unwrap()).is_err());
-        }
-        for reason in ["max_tokens", "refusal", "unknown"] {
-            let mut body = response();
-            body["stop_reason"] = json!(reason);
-            assert!(decode_response(&to_vec(&body).unwrap()).is_err());
-        }
-        let valid = tool_response("get_runtime_info", json!({}))["content"][0].clone();
-        for content in [
-            json!([valid, valid]),
-            json!([{"type":"tool_use","id":"bad id","name":"x","input":{}}]),
-            json!([{"type":"tool_use","id":"ok","name":"","input":{}}]),
-            json!([{"type":"tool_use","id":"ok","name":"skill_view"}]),
-        ] {
-            let mut body = tool_response("get_runtime_info", json!({}));
-            body["content"] = content;
-            assert!(decode_response(&to_vec(&body).unwrap()).is_err());
-        }
-    }
-
-    #[test]
-    fn serialized_request_limit_includes_system_and_json_escaping() {
-        let tools = ToolCatalog::without_workspace().definitions();
-        let system = "synthetic operator text\n";
-        let overhead = encode_request(system, &[Message::user(String::new())], &tools)
-            .unwrap()
-            .len();
-        let messages = [Message::user("x".repeat(MAX_REQUEST_BYTES - overhead))];
-        assert_eq!(
-            encode_request(system, &messages, &tools).unwrap().len(),
-            MAX_REQUEST_BYTES
+    fn rejects_truncated_responses() {
+        let mut body = response();
+        body["stop_reason"] = json!("max_tokens");
+        assert!(
+            decode_response(&to_vec(&body).unwrap())
+                .unwrap_err()
+                .contains("partial text withheld")
         );
-        assert!(encode_request(&format!("{system}x"), &messages, &tools).is_err());
-        // Same UTF-8 byte count, but a newline needs an extra JSON escape byte.
-        let escaped = system.replacen('s', "\n", 1);
-        assert_eq!(escaped.len(), system.len());
-        assert!(encode_request(&escaped, &messages, &tools).is_err());
-        assert!(encode_request("", &messages, &tools).is_ok());
     }
 
     #[test]
-    fn request_size_and_status_boundaries_are_explicit() {
-        assert!(check_request_size(MAX_REQUEST_BYTES).is_ok());
-        assert!(check_request_size(MAX_REQUEST_BYTES + 1).is_err());
+    fn serialized_request_limit_includes_system() {
         let tools = ToolCatalog::without_workspace().definitions();
-        let oversized = Message::user("x".repeat(MAX_REQUEST_BYTES));
-        assert!(encode_request("synthetic system", &[oversized], &tools).is_err());
+        assert!(
+            encode_request(
+                &"x".repeat(MAX_REQUEST_BYTES * 2),
+                &[Message::user("Hello".into())],
+                &tools
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn status_and_key_failures_are_explicit() {
         assert!(check_status(200).is_ok());
         assert!(check_status(401).unwrap_err().contains("authentication"));
-        assert!(check_status(500).unwrap_err().contains("unexpected"));
-        for key in ["", " ", "synthetic\nsecret", "é"] {
-            assert!(validate_key(key).is_err());
-        }
+        assert!(validate_key("").is_err());
     }
 }

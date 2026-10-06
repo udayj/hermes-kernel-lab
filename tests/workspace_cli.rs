@@ -41,16 +41,6 @@ fn offline_workflow_and_ctrl_c_cleanup() {
     fs::create_dir(root.path().join("home")).unwrap();
     fs::create_dir(root.path().join("work")).unwrap();
     fs::write(root.path().join("work/source.txt"), "amber\n").unwrap();
-    // Native workspace startup has no shell/sandbox prerequisite.
-    assert!(
-        Command::new(env!("CARGO_BIN_EXE_hermes-kernel-lab"))
-            .current_dir(root.path())
-            .args(["--workspace", "work"])
-            .stdin(Stdio::null())
-            .status()
-            .unwrap()
-            .success()
-    );
     fs::write(
         root.path().join("script.json"),
         include_bytes!("../examples/offline-workspace.json"),

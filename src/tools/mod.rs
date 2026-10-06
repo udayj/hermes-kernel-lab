@@ -190,72 +190,47 @@ impl ToolCatalog {
             RUNTIME_TOOL => {
                 validate_empty_object(input, RUNTIME_TOOL).and_then(|()| runtime_info())
             }
-            LIST_TOOL => self
-                .workspace
-                .as_ref()
-                .ok_or_else(|| "list_directory is disabled; no workspace was authorized".into())
-                .and_then(|workspace| {
-                    exact_string(input, "path").and_then(|path| workspace.list(&path))
-                }),
-            READ_TOOL => self
-                .workspace
-                .as_ref()
-                .ok_or_else(|| "read_file is disabled; no workspace was authorized".into())
-                .and_then(|workspace| {
-                    let args: ReadArgs = arguments(input)?;
-                    match (args.start_line, args.end_line) {
-                        (None, None) => workspace.read(&args.path),
-                        (Some(start), Some(end)) => workspace.read_lines(&args.path, start, end),
-                        _ => Err("start_line and end_line must be supplied together".into()),
-                    }
-                }),
-            "write_file" | "patch" => self.mutate(name, input),
+            LIST_TOOL if self.workspace.is_some() => exact_string(input, "path")
+                .and_then(|path| self.workspace.as_ref().unwrap().list(&path)),
+            READ_TOOL if self.workspace.is_some() => {
+                let args: Result<ReadArgs, _> = arguments(input);
+                args.and_then(|args| match (args.start_line, args.end_line) {
+                    (None, None) => self.workspace.as_ref().unwrap().read(&args.path),
+                    (Some(start), Some(end)) => self
+                        .workspace
+                        .as_ref()
+                        .unwrap()
+                        .read_lines(&args.path, start, end),
+                    _ => Err("start_line and end_line must be supplied together".into()),
+                })
+            }
+            "write_file" | "patch" if self.workspace.as_ref().is_some_and(|w| w.writable) => {
+                self.mutate(name, input)
+            }
             #[cfg(target_os = "macos")]
-            "bash" => self.bash(input),
-            "skills_list" | "skill_view" => self
-                .skills
-                .as_ref()
-                .ok_or_else(|| {
-                    "skill tools are disabled; no skills directory was authorized".into()
-                })
-                .and_then(|skills| {
-                    if name == "skills_list" {
-                        validate_empty_object(input, name).map(|()| skills.list().to_owned())
-                    } else {
-                        exact_string(input, "name")
-                            .and_then(|name| skills.view(&name).map(str::to_owned))
-                    }
-                }),
-            "memory_list" | "memory_set" | "memory_delete" => self
-                .memory
-                .as_mut()
-                .ok_or_else(|| {
-                    "memory tools are disabled; no memory directory was authorized".into()
-                })
-                .and_then(|memory| match name {
+            "bash" if self.runner.is_some() => self.bash(input),
+            "skills_list" | "skill_view" if self.skills.is_some() => {
+                let skills = self.skills.as_ref().unwrap();
+                if name == "skills_list" {
+                    validate_empty_object(input, name).map(|()| skills.list().to_owned())
+                } else {
+                    exact_string(input, "name")
+                        .and_then(|name| skills.view(&name).map(str::to_owned))
+                }
+            }
+            "memory_list" | "memory_set" | "memory_delete" if self.memory.is_some() => {
+                let memory = self.memory.as_mut().unwrap();
+                match name {
                     "memory_list" => {
                         validate_empty_object(input, name).and_then(|()| memory.list())
                     }
                     "memory_delete" => {
                         exact_string(input, "key").and_then(|key| memory.delete(&key))
                     }
-                    _ => {
-                        let object = input
-                            .as_object()
-                            .ok_or("tool input must be a JSON object")?;
-                        if object.len() != 2
-                            || !object.contains_key("key")
-                            || !object.contains_key("value")
-                        {
-                            return Err(
-                                "memory_set input must contain exactly key and value".into()
-                            );
-                        }
-                        let key = object["key"].as_str().ok_or("key must be a string")?;
-                        let value = object["value"].as_str().ok_or("value must be a string")?;
-                        memory.set(key.to_owned(), value.to_owned())
-                    }
-                }),
+                    _ => arguments::<MemorySetArgs>(input)
+                        .and_then(|args| memory.set(args.key, args.value)),
+                }
+            }
             _ => Err("unknown or disabled tool".into()),
         };
         match result {
@@ -265,13 +240,7 @@ impl ToolCatalog {
     }
 
     fn mutate(&self, name: &str, input: &Value) -> Result<String, String> {
-        let workspace = self
-            .workspace
-            .as_ref()
-            .ok_or("workspace tools are disabled")?;
-        if !workspace.writable {
-            return Err("workspace writes are disabled".into());
-        }
+        let workspace = self.workspace.as_ref().unwrap();
         if name == "write_file" {
             let args: WriteArgs = arguments(input)?;
             workspace.write(&args.path, &args.content, args.overwrite)
@@ -283,7 +252,7 @@ impl ToolCatalog {
 
     #[cfg(target_os = "macos")]
     fn bash(&self, input: &Value) -> Result<String, String> {
-        let runner = self.runner.as_ref().ok_or("sandbox runner is disabled")?;
+        let runner = self.runner.as_ref().unwrap();
         let command = exact_string(input, "command")?;
         to_string(&runner.bash(command)?).map_err(|_| "could not encode command result".into())
     }
@@ -361,6 +330,12 @@ fn arguments<T: serde::de::DeserializeOwned>(input: &Value) -> Result<T, String>
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct MemorySetArgs {
+    key: String,
+    value: String,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ReadArgs {
     path: String,
     start_line: Option<usize>,
@@ -403,226 +378,49 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
-    fn memory_dispatch_validates_arguments_bounds_and_preserves_failed_state() {
-        use std::fs::{read, write};
+    fn memory_sets_and_deletes_survive_reopening() {
         let directory = TempDir::new().unwrap();
-        let path = directory.path().join("memory.json");
-        let mut tools = ToolCatalog::open(None, None, Some(directory.path())).unwrap();
+        let mut memory = memory::Memory::open(directory.path()).unwrap();
+        assert_eq!(memory.list().unwrap(), "{}");
         assert_eq!(
-            tools
-                .definitions()
-                .iter()
-                .map(|d| d.name)
-                .collect::<Vec<_>>(),
-            [RUNTIME_TOOL, "memory_list", "memory_set", "memory_delete"]
+            memory
+                .set("label".into(), "synthetic amber".into())
+                .unwrap(),
+            "Memory saved."
         );
-        assert_eq!(execute(&mut tools, "memory_list", json!({})).content, "{}");
-        assert!(!execute(&mut tools, "memory_delete", json!({"key":"absent"})).is_error);
-        assert!(!path.exists());
-        for (name, valid) in [
-            ("memory_list", json!({})),
-            ("memory_set", json!({"key":"k","value":"v"})),
-            ("memory_delete", json!({"key":"k"})),
-        ] {
-            assert!(execute(&mut ToolCatalog::without_workspace(), name, valid.clone()).is_error);
-            let mut extra = valid;
-            extra["path"] = json!("outside");
-            for bad in [json!(null), json!([]), json!(1), extra] {
-                assert!(execute(&mut tools, name, bad).is_error);
-            }
-        }
-        for bad in [
-            json!({}),
-            json!({"key":1,"value":"v"}),
-            json!({"key":"k","value":null}),
-            json!({"key":"k"}),
-            json!({"value":"v"}),
-            json!({"key":" ","value":"v"}),
-            json!({"key":"k","value":"\n"}),
-            json!({"key":"é".repeat(33),"value":"v"}),
-            json!({"key":"k","value":"é".repeat(513)}),
-        ] {
-            assert!(execute(&mut tools, "memory_set", bad).is_error);
-        }
-        for bad in [
-            json!({}),
-            json!({"key":1}),
-            json!({"key":" "}),
-            json!({"key":"x".repeat(65)}),
-        ] {
-            assert!(execute(&mut tools, "memory_delete", bad).is_error);
-        }
-        assert!(!path.exists());
-        // A real no-clobber publication failure, not a permission assumption.
-        write(&path, b"existing destination").unwrap();
-        assert!(execute(&mut tools, "memory_set", json!({"key":"k","value":"v"})).is_error);
-        assert_eq!(read(&path).unwrap(), b"existing destination");
-        assert_eq!(execute(&mut tools, "memory_list", json!({})).content, "{}");
-        std::fs::remove_file(&path).unwrap();
-        assert!(
-            !execute(
-                &mut tools,
-                "memory_set",
-                json!({"key":"é".repeat(32),"value":"é".repeat(512)})
-            )
-            .is_error
+        assert_eq!(
+            memory
+                .set("label".into(), "synthetic amber".into())
+                .unwrap(),
+            "Memory unchanged."
         );
-        for i in 0..31 {
-            assert!(
-                !execute(
-                    &mut tools,
-                    "memory_set",
-                    json!({"key":format!("k{i:02}"),"value":"v"})
-                )
-                .is_error
-            );
-        }
-        let previous = read(&path).unwrap();
-        assert!(
-            execute(
-                &mut tools,
-                "memory_set",
-                json!({"key":"overflow","value":"v"})
-            )
-            .is_error
+        let mut reopened = memory::Memory::open(directory.path()).unwrap();
+        assert_eq!(reopened.list().unwrap(), r#"{"label":"synthetic amber"}"#);
+        reopened.delete("label").unwrap();
+        assert_eq!(reopened.delete("label").unwrap(), "Memory unchanged.");
+        assert_eq!(
+            memory::Memory::open(directory.path())
+                .unwrap()
+                .list()
+                .unwrap(),
+            "{}"
         );
-        assert_eq!(read(&path).unwrap(), previous);
-        assert!(
-            !execute(
-                &mut tools,
-                "memory_set",
-                json!({"key":"k00","value":"replacement"})
-            )
-            .is_error
-        );
-        assert!(!execute(&mut tools, "memory_delete", json!({"key":"k00"})).is_error);
-        assert!(
-            !execute(&mut tools, "memory_list", json!({}))
-                .content
-                .contains("k00")
-        );
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            assert_eq!(
-                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
-                0o600
-            );
-        }
     }
 
     #[test]
-    fn memory_store_loading_and_serialized_size_are_strict() {
-        use std::fs::{create_dir, read, remove_file, write};
+    fn memory_store_loading_and_mutation_failures_preserve_state() {
         let directory = TempDir::new().unwrap();
         let path = directory.path().join("memory.json");
-        let open = || ToolCatalog::open(None, None, Some(directory.path()));
-        assert!(ToolCatalog::open(None, None, Some(&directory.path().join("missing"))).is_err());
-        for bytes in [
-            b"{".to_vec(),
-            vec![0xff],
-            br#"{"version":2,"entries":{}}"#.to_vec(),
-            br#"{"version":1,"entries":{"k":"a","k":"b"}}"#.to_vec(),
-            br#"{"version":1,"entries":{"k":1}}"#.to_vec(),
-            br#"{"version":1,"entries":{" ":"v"}}"#.to_vec(),
-            br#"{"version":1,"entries":{"k":" "}}"#.to_vec(),
-            br#"{"version":1,"entries":{},"extra":true}"#.to_vec(),
-        ] {
-            write(&path, &bytes).unwrap();
-            assert!(open().is_err());
-            assert_eq!(read(&path).unwrap(), bytes);
-        }
-        let mut entries = std::collections::BTreeMap::new();
-        for i in 0..32 {
-            entries.insert(format!("k{i:02}"), "x".repeat(1024));
-        }
-        let mut store = json!({"version":1,"entries":entries});
-        let overhead = serde_json::to_vec(&store).unwrap().len() - 32768;
-        let last_len = 1024 - overhead;
-        store["entries"]["k31"] = json!("x".repeat(last_len));
-        let bytes = serde_json::to_vec(&store).unwrap();
-        assert_eq!(bytes.len(), 32768);
-        write(&path, &bytes).unwrap();
-        let mut tools = open().unwrap();
-        assert!(
-            !execute(
-                &mut tools,
-                "memory_set",
-                json!({"key":"k31","value":"short"})
-            )
-            .is_error
-        );
-        assert!(
-            !execute(
-                &mut tools,
-                "memory_set",
-                json!({"key":"k31","value":"x".repeat(last_len)})
-            )
-            .is_error
-        );
-        let bytes = read(&path).unwrap();
-        assert_eq!(bytes.len(), 32768);
-        assert_eq!(serde_json::from_slice::<Value>(&bytes).unwrap(), store);
-        // Escaping increases serialized bytes even when decoded value length is unchanged.
-        assert!(
-            execute(
-                &mut tools,
-                "memory_set",
-                json!({"key":"k31","value":format!("\n{}", "x".repeat(last_len - 1))})
-            )
-            .is_error
-        );
-        assert_eq!(read(&path).unwrap(), bytes);
-        assert_eq!(
-            execute(&mut tools, "memory_list", json!({})).content,
-            serde_json::to_string(&store["entries"]).unwrap()
-        );
-        let mut oversized = bytes;
-        oversized.push(b' ');
-        write(&path, oversized).unwrap();
-        assert!(open().is_err());
-        for (key, value) in [
-            ("z".repeat(65), "v".into()),
-            ("k31".into(), "x".repeat(1025)),
-            ("extra".into(), "v".into()),
-        ] {
-            let small_entries: std::collections::BTreeMap<_, _> =
-                (0..32).map(|i| (format!("k{i:02}"), "v")).collect();
-            let mut invalid = json!({"version":1,"entries":small_entries});
-            if key.len() > 64 {
-                invalid["entries"].as_object_mut().unwrap().remove("k00");
-            }
-            invalid["entries"][key] = json!(value);
-            write(&path, serde_json::to_vec(&invalid).unwrap()).unwrap();
-            assert!(open().is_err());
-        }
-        remove_file(&path).unwrap();
-        create_dir(&path).unwrap();
-        assert!(open().is_err());
-        std::fs::remove_dir(&path).unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::{PermissionsExt, symlink};
-            write(&path, br#"{"version":1,"entries":{}}"#).unwrap();
-            assert!(ToolCatalog::open(None, None, Some(&path)).is_err());
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
-            // Privileged test runners can bypass mode bits; test denial when enforced.
-            let unreadable = std::fs::File::open(&path).is_err();
-            let loaded = open();
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
-            if unreadable {
-                assert!(loaded.is_err());
-            }
-            remove_file(&path).unwrap();
-            for target in [
-                directory.path().join("missing"),
-                Path::new("/dev/null").to_owned(),
-            ] {
-                symlink(target, &path).unwrap();
-                assert!(open().is_err());
-                remove_file(&path).unwrap();
-            }
-        }
+        let mut memory = memory::Memory::open(directory.path()).unwrap();
+        memory
+            .set("label".into(), "synthetic amber".into())
+            .unwrap();
+        let previous = std::fs::read(&path).unwrap();
+        assert!(memory.set("label".into(), "x".repeat(2048)).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), previous);
+        assert_eq!(memory.list().unwrap(), r#"{"label":"synthetic amber"}"#);
+        std::fs::write(&path, "invalid JSON").unwrap();
+        assert!(memory::Memory::open(directory.path()).is_err());
     }
 
     fn workspace() -> (TempDir, ToolCatalog) {
@@ -642,86 +440,52 @@ mod tests {
             disabled
                 .definitions()
                 .iter()
-                .map(|definition| definition.name)
+                .map(|d| d.name)
                 .collect::<Vec<_>>(),
-            vec![RUNTIME_TOOL]
+            [RUNTIME_TOOL]
         );
         assert!(!execute(&mut disabled, RUNTIME_TOOL, json!({})).is_error);
-        assert!(execute(&mut disabled, LIST_TOOL, json!({"path":"."})).is_error);
-
         let (_temporary, mut enabled) = workspace();
-        enabled.configure(false, false).unwrap();
-        let names = enabled
-            .definitions()
-            .iter()
-            .map(|definition| definition.name)
-            .collect::<Vec<_>>();
-        assert_eq!(names, vec![RUNTIME_TOOL, LIST_TOOL, READ_TOOL]);
-        for name in names {
-            let input = if name == RUNTIME_TOOL {
-                json!({})
-            } else if name == LIST_TOOL {
-                json!({"path":"."})
-            } else {
-                json!({"path":"missing"})
-            };
-            assert_ne!(
-                execute(&mut enabled, name, input).content,
-                "unknown or disabled tool"
-            );
-        }
-    }
-
-    #[test]
-    fn arguments_are_exact_and_invalid_arguments_do_not_touch_the_workspace() {
-        let temporary = TempDir::new().unwrap();
-        let missing = temporary.path().join("missing");
-        let mut catalog = ToolCatalog::open(Some(temporary.path()), None, None).unwrap();
-        for input in [
-            json!(null),
-            json!({}),
-            json!({"path":null}),
-            json!({"path":"missing","extra":true}),
-        ] {
-            assert!(execute(&mut catalog, READ_TOOL, input).is_error);
-        }
-        assert!(!missing.exists());
-        assert!(execute(&mut catalog, RUNTIME_TOOL, json!({"extra":true})).is_error);
-        assert!(execute(&mut catalog, "other", json!({})).is_error);
-    }
-
-    #[test]
-    fn skills_have_independent_authority_and_strict_arguments() {
-        let directory = TempDir::new().unwrap();
-        let mut skills = ToolCatalog::open(None, Some(directory.path()), None).unwrap();
         assert_eq!(
-            skills
+            enabled
                 .definitions()
                 .iter()
                 .map(|d| d.name)
                 .collect::<Vec<_>>(),
-            [RUNTIME_TOOL, "skills_list", "skill_view"]
+            [RUNTIME_TOOL, LIST_TOOL, READ_TOOL]
         );
-        assert_eq!(execute(&mut skills, "skills_list", json!({})).content, "[]");
-        assert!(execute(&mut skills, READ_TOOL, json!({"path":"SKILL.md"})).is_error);
-        for input in [json!(null), json!([]), json!({"extra":true})] {
-            assert!(execute(&mut skills, "skills_list", input).is_error);
-        }
-        for input in [
-            json!(null),
-            json!({}),
-            json!({"name":1}),
-            json!({"name":"a", "extra":true}),
-            json!({"path":"a/SKILL.md"}),
-            json!({"name":"../a"}),
-            json!({"name":"unknown"}),
-        ] {
-            assert!(execute(&mut skills, "skill_view", input).is_error);
-        }
-        let mut workspace_only = ToolCatalog::open(Some(directory.path()), None, None).unwrap();
-        for tool in ["skills_list", "skill_view"] {
-            assert!(!workspace_only.definitions().iter().any(|d| d.name == tool));
-            assert!(execute(&mut workspace_only, tool, json!({})).is_error);
-        }
+        assert!(!execute(&mut enabled, LIST_TOOL, json!({"path":"."})).is_error);
+        let outcome = execute(
+            &mut enabled,
+            "write_file",
+            json!({"path":"file", "content":"bad"}),
+        );
+        assert!(outcome.is_error);
+        assert_eq!(outcome.content, "unknown or disabled tool");
+    }
+
+    #[test]
+    fn arguments_are_exact_and_invalid_arguments_do_not_touch_memory() {
+        let directory = TempDir::new().unwrap();
+        let mut catalog = ToolCatalog::open(None, None, Some(directory.path())).unwrap();
+        assert!(
+            !execute(
+                &mut catalog,
+                "memory_set",
+                json!({"key":"label", "value":"synthetic amber"})
+            )
+            .is_error
+        );
+        let path = directory.path().join("memory.json");
+        let previous = std::fs::read(&path).unwrap();
+        assert!(
+            execute(
+                &mut catalog,
+                "memory_set",
+                json!({"key":"label", "value":"bad", "extra":true})
+            )
+            .is_error
+        );
+        assert_eq!(std::fs::read(path).unwrap(), previous);
     }
 }

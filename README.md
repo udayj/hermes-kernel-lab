@@ -11,8 +11,10 @@ conversation saving, and sandboxed command execution on macOS.
 
 ## Run
 
-Set `ANTHROPIC_API_KEY` in the environment or a `.env` file in the current directory.
-An existing environment variable takes precedence. API requests incur usage charges.
+Set `ANTHROPIC_API_KEY` in the environment or a `.env` file found by dotenvy in the
+current directory or a parent. Existing environment variables take precedence.
+Credentials are resolved at startup, even for EOF or `/exit`. Offline scripts need
+no credentials. API requests incur usage charges.
 
 ```sh
 cargo run --
@@ -150,33 +152,29 @@ skill editing are unsupported. Synthetic examples can be selected with
 
 ## Memory and conversation state
 
-`--memory-dir PATH` independently enables `memory_list({})`,
-`memory_set({key, value})`, and `memory_delete({key})` for one fixed `memory.json`
-in an existing trusted directory. Startup validates and loads it once. Missing
-means empty; malformed, duplicate-key, oversized, symlink, and non-regular stores
-fail locally. Entries enter context through tool results. Setting an unchanged
-value or deleting an absent key is a successful no-op. Memory is plaintext;
-deleting a fact does not erase copies in historical conversations.
+`--memory-dir PATH` enables `memory_list({})`, `memory_set({key, value})`, and
+`memory_delete({key})` for `memory.json` in an existing trusted directory. Startup
+loads it once; missing means empty, malformed or oversized stores fail, and duplicate
+entry keys use the last value. Unchanged sets and absent deletes are successful no-ops.
+Facts enter context through tool results; deletion cannot erase historical copies.
 
 Completed turns save under `$HOME/.hermes-kernel-lab/sessions/`; HOME must be an
-existing absolute directory. The resume path prints after the first save.
-`--resume-session PATH` restores validated system text and ordered history,
-including correlated tool results. Historical tools are never replayed. Workspace,
-write, shell, skill, and memory authority must be supplied again for current access;
-saved history grants none. Skill snapshots are rebuilt for the new invocation.
+existing absolute directory. The resume path prints once at startup, before saving.
+`--resume-session PATH` restores trusted system text and history after checking the
+JSON schema, version/provider/model, and a final assistant message without a tool call.
+Historical tools are never replayed. Current workspace, write, shell, skill, and memory
+authority must be supplied again; saved history grants none. Skills are reloaded.
 
-Saving follows successful answer output and flushing. Turn/save failures stop the
-program and preserve the previous checkpoint; saving can fail after an answer has
-been displayed. No completed new turn means no checkpoint update. Checkpoints
-must be trusted and contain plaintext conversation and tool output, without secret
-redaction.
+Saving follows answer output and flushing. Turn/save failures stop the program and
+preserve the previous checkpoint, even if an answer was displayed. No completed turn
+means no checkpoint update. Checkpoints and memory are plaintext, without redaction.
 
-Native workspace writes, memory, and checkpoints synchronize a staged file and
-publish atomically. New destinations refuse clobbering; Unix files use 0600.
-The parent directory is not synchronized, so power-loss durability is not guaranteed,
-and crashes may leave temporary files. One writer is assumed. Published writes and
-command effects survive later model, output, or checkpoint failures: there is no
-turn-level rollback or automatic command retry.
+Memory and checkpoints use ordinary filesystem reads followed by a size check.
+Reads follow symlinks; saves synchronize a `NamedTempFile` and atomically replace the
+destination, including an existing file at a new path. Unix staged files use 0600.
+Native workspace writes retain their destination checks. Parent directories are not
+synchronized; power-loss durability is not guaranteed. One writer is assumed. Tool
+and command effects survive later turn failures; there is no rollback or retry.
 
 ## Limits and checks
 

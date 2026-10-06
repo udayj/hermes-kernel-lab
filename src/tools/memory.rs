@@ -1,12 +1,7 @@
-use crate::bounded::{ReadError, read_bounded};
-use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt};
-use cap_std::{
-    ambient_authority,
-    fs::{Dir, OpenOptions},
-};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
+    fs::read,
     io::{ErrorKind, Write},
     path::{Path, PathBuf},
 };
@@ -18,14 +13,12 @@ const MAX_BYTES: usize = 32 * 1024;
 #[serde(deny_unknown_fields)]
 struct Store {
     version: u32,
-    #[serde(with = "serde_with::rust::maps_duplicate_key_is_error")]
     entries: BTreeMap<String, String>,
 }
 
 pub(super) struct Memory {
     path: PathBuf,
     store: Store,
-    existing: bool,
 }
 
 impl Memory {
@@ -33,41 +26,27 @@ impl Memory {
         let directory = directory
             .canonicalize()
             .map_err(|_| "memory directory must exist")?;
-        let root = Dir::open_ambient_dir(&directory, ambient_authority())
-            .map_err(|_| "memory directory must be readable")?;
+        if !directory.is_dir() {
+            return Err("memory directory must be a directory".into());
+        }
         let mut memory = Self {
             path: directory.join("memory.json"),
             store: Store {
                 version: 1,
                 entries: BTreeMap::new(),
             },
-            existing: false,
         };
-        match root.symlink_metadata("memory.json") {
+        let bytes = match read(&memory.path) {
+            Ok(bytes) => bytes,
             Err(error) if error.kind() == ErrorKind::NotFound => return Ok(memory),
-            Ok(metadata) if metadata.is_file() => {}
-            _ => return Err("memory.json must be a readable regular file, not a symlink".into()),
+            Err(_) => return Err("could not read memory.json".into()),
+        };
+        if bytes.len() > MAX_BYTES {
+            return Err("memory.json exceeds 32 KiB".into());
         }
-        let mut options = OpenOptions::new();
-        options.read(true).follow(FollowSymlinks::No);
-        let file = root
-            .open_with("memory.json", &options)
-            .map_err(|_| "could not open memory.json")?;
-        if !file
-            .metadata()
-            .map_err(|_| "could not inspect memory.json")?
-            .is_file()
-        {
-            return Err("memory.json must be a regular file".into());
-        }
-        let bytes = read_bounded(file, MAX_BYTES as u64).map_err(|error| match error {
-            ReadError::Io => "could not read memory.json",
-            ReadError::TooLarge => "memory.json exceeds 32 KiB",
-        })?;
         memory.store =
             serde_json::from_slice(&bytes).map_err(|_| "invalid memory JSON or schema")?;
         encode(&memory.store)?;
-        memory.existing = true;
         Ok(memory)
     }
 
@@ -111,20 +90,10 @@ impl Memory {
             .flush()
             .and_then(|()| staged.as_file().sync_all())
             .map_err(|_| "could not sync memory")?;
-        if self.existing {
-            if !std::fs::symlink_metadata(&self.path)
-                .map_err(|_| "could not inspect memory destination")?
-                .is_file()
-            {
-                return Err("memory destination must remain a regular file".into());
-            }
-            staged.persist(&self.path)
-        } else {
-            staged.persist_noclobber(&self.path)
-        }
-        .map_err(|_| "could not publish memory")?;
+        staged
+            .persist(&self.path)
+            .map_err(|_| "could not publish memory")?;
         self.store = next;
-        self.existing = true;
         Ok(())
     }
 }

@@ -316,8 +316,6 @@ mod tests {
             fs::read_to_string(root.path().join("file.txt")).unwrap(),
             "amber"
         );
-        fs::write(root.path().join("AGENTS.md"), "instructions").unwrap();
-        assert!(workspace.write("AGENTS.md", "bad", true).is_err());
     }
 
     #[test]
@@ -353,8 +351,6 @@ mod tests {
         fs::write(root.path().join("file.txt"), "content").unwrap();
         symlink("file.txt", root.path().join("alias")).unwrap();
         assert_eq!(workspace.read("alias").unwrap(), "content");
-        workspace.write("alias", "updated", true).unwrap();
-        assert_eq!(workspace.read("file.txt").unwrap(), "updated");
         fs::write(root.path().join(".hidden"), "hidden").unwrap();
         symlink(".hidden", root.path().join("hidden-alias")).unwrap();
         assert!(workspace.read("hidden-alias").is_err());

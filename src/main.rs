@@ -9,58 +9,54 @@ use agent::{Agent, compose_instructions};
 use bounded::{ReadError, read_bounded};
 use clap::Parser;
 use cli::{Cli, StdinEvent, read_stdin_event};
-use dotenvy::from_read_iter;
 use session::{Checkpoint, Session};
 use std::{
     collections::VecDeque,
-    env::{VarError, var, var_os},
+    env::{var, var_os},
     fs::File,
-    io::{IsTerminal, Read, Write, stderr, stdin, stdout},
+    io::{IsTerminal, Write, stderr, stdin, stdout},
     path::Path,
     process::ExitCode,
 };
 use tools::ToolCatalog;
 
-fn key_from_dotenv(reader: impl Read) -> Result<String, String> {
-    let mut key = None;
-    for entry in from_read_iter(reader) {
-        let (name, value) = entry.map_err(|_| "could not parse .env; check its syntax")?;
-        if name == "ANTHROPIC_API_KEY" {
-            if key.is_some() {
-                return Err(".env contains duplicate ANTHROPIC_API_KEY entries".into());
-            }
-            key = Some(value);
-        }
-    }
-    key.ok_or_else(|| "ANTHROPIC_API_KEY is missing from .env".into())
-}
-
 fn api_key() -> Result<String, String> {
-    match var("ANTHROPIC_API_KEY") {
-        Ok(key) => Ok(key),
-        Err(VarError::NotUnicode(_)) => Err("ANTHROPIC_API_KEY must be valid Unicode".into()),
-        Err(VarError::NotPresent) => {
-            let file = File::open(".env").map_err(|_| {
-                "set ANTHROPIC_API_KEY in the environment or a readable .env in the current directory"
-            })?;
-            key_from_dotenv(file)
-        }
-    }
+    dotenvy::dotenv().ok();
+    var("ANTHROPIC_API_KEY").map_err(|_| "set ANTHROPIC_API_KEY in the environment or .env".into())
 }
 
 fn run_stdin(
     tools: ToolCatalog,
     session: Session,
     checkpoint: Option<Checkpoint>,
-    mut script: Option<VecDeque<serde_json::Value>>,
+    script: Option<VecDeque<serde_json::Value>>,
 ) -> Result<(), String> {
+    let checkpoint = match checkpoint {
+        Some(checkpoint) => checkpoint,
+        None => {
+            let home = var_os("HOME")
+                .filter(|home| !home.is_empty())
+                .ok_or("HOME must be set for automatic session saving")?;
+            Checkpoint::automatic(Path::new(&home))?
+        }
+    };
+    let mut error_output = stderr().lock();
+    let agent_checkpoint_path = checkpoint.path().display().to_string();
+    let mut agent = match script {
+        Some(script) => Agent::from_script(script, tools, session, checkpoint),
+        None => Agent::new(api_key()?, tools, session, checkpoint)?,
+    };
+    writeln!(
+        error_output,
+        "Session will be saved to {}",
+        agent_checkpoint_path
+    )
+    .and_then(|()| error_output.flush())
+    .map_err(|_| "could not print the resume path to stderr")?;
     let stdin = stdin();
     let show_prompt = stdin.is_terminal();
     let mut input = stdin.lock();
     let mut output = stdout().lock();
-    let mut error_output = stderr().lock();
-    let mut startup = Some((tools, session, checkpoint));
-    let mut agent = None;
 
     loop {
         if show_prompt {
@@ -71,50 +67,7 @@ fn run_stdin(
         match read_stdin_event(&mut input)? {
             StdinEvent::Blank => continue,
             StdinEvent::Exit | StdinEvent::Eof => return Ok(()),
-            StdinEvent::Message(message) => {
-                if agent.is_none() {
-                    let key = if script.is_none() {
-                        Some(api_key()?)
-                    } else {
-                        None
-                    };
-                    let (tools, session, checkpoint) =
-                        startup.take().expect("agent is initialized only once");
-                    let checkpoint = match checkpoint {
-                        Some(checkpoint) => checkpoint,
-                        None => {
-                            let home = var_os("HOME")
-                                .filter(|home| !home.is_empty())
-                                .ok_or("HOME must be set for automatic session saving")?;
-                            Checkpoint::automatic(Path::new(&home))?
-                        }
-                    };
-                    agent = Some(match script.take() {
-                        Some(script) => Agent::from_script(script, tools, session, checkpoint),
-                        None => Agent::new(
-                            key.expect("live credentials loaded"),
-                            tools,
-                            session,
-                            checkpoint,
-                        )?,
-                    });
-                }
-                if let Some(path) = agent
-                    .as_mut()
-                    .expect("agent was initialized")
-                    .run_turn(message, &mut output)?
-                {
-                    writeln!(
-                        error_output,
-                        "Resume this session with --resume-session {}",
-                        path.display()
-                    )
-                    .and_then(|()| error_output.flush())
-                    .map_err(
-                        |_| "checkpoint saved, but could not print its resume path to stderr",
-                    )?;
-                }
-            }
+            StdinEvent::Message(message) => agent.run_turn(message, &mut output)?,
         }
     }
 }
@@ -136,7 +89,7 @@ fn run() -> Result<(), String> {
         cli.memory_dir.as_deref(),
     )?;
     let (session, checkpoint) = if let Some(path) = &cli.resume_session {
-        let checkpoint = Checkpoint::open(path, true)?;
+        let checkpoint = Checkpoint::open(path)?;
         let session = checkpoint
             .load()
             .map_err(|error| format!("{}: {error}", checkpoint.path().display()))?;
@@ -176,9 +129,7 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs::{create_dir, remove_dir, remove_file, write};
-    #[cfg(unix)]
-    use std::os::unix::fs::symlink;
+    use std::fs::write;
     use tempfile::tempdir;
 
     #[test]
@@ -194,64 +145,18 @@ mod tests {
             load_instructions(&tools, None).unwrap(),
             compose_instructions(Some("root default"))
         );
-        for text in ["", "  synthetic operator text\n世界\n  "] {
-            write(directory.path().join("instructions.txt"), text).unwrap();
-            let system = load_instructions(&tools, Some(Path::new("instructions.txt"))).unwrap();
-            assert_eq!(
-                system,
-                format!(
-                    "{}\n\nOperator instructions:\n\n{text}",
-                    compose_instructions(None)
-                )
-            );
-        }
-        let disabled = ToolCatalog::without_workspace();
+        let text = "  synthetic operator text\n世界\n  ";
+        write(directory.path().join("instructions.txt"), text).unwrap();
         assert_eq!(
-            load_instructions(&disabled, None).unwrap(),
-            compose_instructions(None)
+            load_instructions(&tools, Some(Path::new("instructions.txt"))).unwrap(),
+            compose_instructions(Some(text))
         );
-        assert!(load_instructions(&disabled, Some(Path::new("instructions.txt"))).is_err());
-        let default = directory.path().join("AGENTS.md");
-        for bytes in [vec![0xff], vec![b'x'; 32 * 1024 + 1]] {
-            write(&default, bytes).unwrap();
-            assert!(load_instructions(&tools, None).is_err());
-        }
-        remove_file(&default).unwrap();
-        create_dir(&default).unwrap();
-        assert!(load_instructions(&tools, None).is_err());
-        remove_dir(&default).unwrap();
-        #[cfg(unix)]
-        {
-            symlink("missing", &default).unwrap();
-            assert!(load_instructions(&tools, None).is_err());
-        }
     }
 
     #[test]
     fn explicit_instruction_failures_propagate_from_workspace_reads() {
         let directory = tempdir().unwrap();
         let tools = ToolCatalog::open(Some(directory.path()), None, None).unwrap();
-        write(directory.path().join("invalid.bin"), [0xff]).unwrap();
-        // Exhaustive filesystem restrictions belong to workspace tests.
-        for path in ["missing", "invalid.bin", "../outside"] {
-            assert!(load_instructions(&tools, Some(Path::new(path))).is_err());
-        }
-    }
-
-    #[test]
-    fn dotenv_parsing_is_offline_and_errors_do_not_expose_contents() {
-        assert_eq!(
-            key_from_dotenv(b"# synthetic fixture\nANTHROPIC_API_KEY='synthetic-key'\n".as_slice())
-                .unwrap(),
-            "synthetic-key"
-        );
-        for file in [
-            "OTHER=value",
-            "ANTHROPIC_API_KEY=a\nANTHROPIC_API_KEY=b",
-            "ANTHROPIC_API_KEY='synthetic-unclosed",
-        ] {
-            let error = key_from_dotenv(file.as_bytes()).unwrap_err();
-            assert!(!error.contains("synthetic-unclosed"));
-        }
+        assert!(load_instructions(&tools, Some(Path::new("missing"))).is_err());
     }
 }
