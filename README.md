@@ -1,9 +1,49 @@
 # Hermes, Oxidized
 
-A learning project exploring agent runtimes by growing a small Rust program.
-Hermes is a capability reference and case study. The aim is to understand agent
-mechanisms, state, and boundaries through a small implementation, without aiming
-for feature parity or translating its architecture.
+Reading a large agent framework like Hermes top to bottom shows you what it does,
+but rarely why it is built that way. This project takes the other route: growing a
+small Rust program one step at a time, with Hermes as the north star, so each
+design decision shows up at the moment it becomes necessary.
+
+It is a learning project. It does not aim for feature parity and is not a
+translation of Hermes' architecture.
+
+## How it was built
+
+Each step either adds one capability or removes something that turned out not to
+be needed, and answers one question. Read the commits in order to follow along.
+
+[c1]: https://github.com/udayj/hermes-kernel-lab/commit/60a20a8
+[c2]: https://github.com/udayj/hermes-kernel-lab/commit/fd70082
+[c3]: https://github.com/udayj/hermes-kernel-lab/commit/6974ffc
+[c4]: https://github.com/udayj/hermes-kernel-lab/commit/430a778
+[c5]: https://github.com/udayj/hermes-kernel-lab/commit/fb2b4fd
+[c6]: https://github.com/udayj/hermes-kernel-lab/commit/21b2fea
+[c7]: https://github.com/udayj/hermes-kernel-lab/commit/23cd210
+[c8]: https://github.com/udayj/hermes-kernel-lab/commit/7396787
+[c9]: https://github.com/udayj/hermes-kernel-lab/commit/33a5d51
+[c10]: https://github.com/udayj/hermes-kernel-lab/commit/25ba7b7
+[c11]: https://github.com/udayj/hermes-kernel-lab/commit/f2000b0
+[c12]: https://github.com/udayj/hermes-kernel-lab/commit/265ea4b
+
+| # | Step | Kind | Question it answers |
+| --- | --- | --- | --- |
+| 1 | [One model call][c1] | build | What is the smallest thing that talks to a model? |
+| 2 | [Two-turn conversation][c2] | build | Where does conversation state live? |
+| 3 | [Tool awareness][c3] | build | How does a model learn what it can call? |
+| 4 | [Tool execution][c4] | build | Who runs the tool, and how does the result get back? |
+| 5 | [Agent loop and interactive chat][c5] | build | What is the loop, and when does a turn end? |
+| 6 | [System instructions][c6] | build | Whose instructions win? |
+| 7 | [Save and resume][c7] | build | What must be saved to continue a conversation? |
+| 8 | [Simplify turn execution][c8] | prune | Which tests and paths were redundant? |
+| 9 | [Skills][c9] | build | How does an agent load procedures only when needed? |
+| 10 | [Memory][c10] | build | What survives across conversations, and who decides? |
+| 11 | [Write tools and sandboxed shell][c11] | build | What does it take to let the model change things safely? |
+| 12 | [Threat model and cut][c12] | prune | Who is untrusted? Answering that removed a third of the code. |
+
+The whole turn loop is `Agent::run_turn` in [`src/agent.rs`](src/agent.rs).
+
+## What it does today
 
 The CLI uses Anthropic’s Claude Haiku 4.5 (`claude-haiku-4-5-20251001`). It has
 workspace tools, opt-in local skills and cross-session memory, automatic
@@ -24,6 +64,9 @@ printf '%s\n' 'Say hello in one sentence.' | cargo run --
 
 Enter one message per stdin line. Blank lines are ignored; `/exit` or EOF exits.
 Answers and tool results go to stdout; prompts, resume paths, and errors go to stderr.
+The [offline demonstration](#offline-demonstration) runs without credentials.
+
+The rest of this document is reference for current behavior and limits.
 
 ## Workspace tools and permissions
 
