@@ -219,6 +219,29 @@ Native workspace writes retain their destination checks. Parent directories are 
 synchronized; power-loss durability is not guaranteed. One writer is assumed. Tool
 and command effects survive later turn failures; there is no rollback or retry.
 
+## Context compaction
+
+Before each model call, history whose serialized JSON exceeds 256 KiB is compacted.
+Bytes are a rough stand-in for tokens; there is no token counting. Completed
+turns older than the two most recent are rendered as a plain-text transcript and
+sent in one extra tool-free request with summarizer instructions that treat it as
+data. That request does not count toward the per-turn call budget. The current
+turn and the two recent turns stay verbatim. Cuts fall only at user text messages,
+so a tool call is never separated from its result.
+
+The compacted turns are replaced by one ordinary turn: a fixed user marker and the
+model-written summary as an assistant message. Summaries are untrusted model output
+in conversation history, never system text. A later compaction folds the previous
+summary into the new one. A lone previous summary is not re-summarized. stdout shows
+`[Context compacted; N messages replaced by summary]` and the summary. Compaction is
+lossy: exact earlier tool output and wording are gone, and a forgotten skill or fact
+must be fetched again.
+
+The checkpoint saves the compacted history at the end of the turn, so an over-limit
+checkpoint compacts on its next turn after resume. A failed, truncated, or tool-requesting
+summary stops the program like any other model failure, and the previous checkpoint
+is kept. If the protected turns alone are too large, the 1 MiB request check still fails closed.
+
 ## Limits and checks
 
 | Resource | Limit |
@@ -231,14 +254,15 @@ and command effects survive later turn failures; there is no rollback or retry.
 | Model request / response | 1 MiB each |
 | Checkpoint | 2 MiB |
 | Model output / HTTP timeout | 512 tokens / 60 seconds per request |
+| Compaction trigger | 256 KiB serialized history; two recent turns kept |
 
 Invalid arguments, disabled tools, and unknown names return correlated tool errors.
 Command exit failure is represented by its exit code/signal. Protocol, transport,
 budget, and output failures stop the program. Invalid
 or truncated responses never execute tools; a tool request on call eight fails
 before execution. Every turn gets a fresh budget, including after resume.
-Full history accompanies every request, without streaming, retries, compression,
-or history truncation. A valid checkpoint can exceed the next request limit.
+Full history accompanies every request, without streaming or retries, until
+[context compaction](#context-compaction) replaces older turns with a summary.
 
 ```sh
 cargo fmt --check

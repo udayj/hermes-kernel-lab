@@ -20,8 +20,11 @@ struct MessageRequest<'a> {
     stream: bool,
     system: &'a str,
     messages: &'a [Message],
+    // A tool-free request (the compaction summary) omits both fields.
+    #[serde(skip_serializing_if = "<[_]>::is_empty")]
     tools: &'a [ToolDefinition],
-    tool_choice: ToolChoice,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_choice: Option<ToolChoice>,
 }
 
 #[derive(Debug, Serialize)]
@@ -187,10 +190,10 @@ pub(crate) fn encode_request(
         system,
         messages,
         tools,
-        tool_choice: ToolChoice {
+        tool_choice: (!tools.is_empty()).then_some(ToolChoice {
             kind: "auto",
             disable_parallel_tool_use: true,
-        },
+        }),
     })
     .map_err(|_| "could not encode the request as JSON")?;
     check_request_size(body.len())?;
