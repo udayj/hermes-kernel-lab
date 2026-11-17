@@ -75,11 +75,14 @@ impl Agent {
         for calls in 1..=MAX_MODEL_CALLS_PER_TURN {
             self.compact_if_needed(output)?;
             let definitions = self.tools.definitions();
-            let response =
-                self.model
-                    .send(&self.session.system, &self.session.messages, &definitions)?;
+            let response = self.model.send(
+                &self.session.system,
+                &self.session.messages,
+                &definitions,
+                output,
+            )?;
+            finish_assistant_output(output, &response)?;
             check_call_budget(&response, calls)?;
-            write_assistant(output, &response)?;
             let tool_call = response.tool_call.clone();
             self.session
                 .messages
@@ -121,9 +124,12 @@ impl Agent {
         }
 
         let transcript = render_transcript(&messages[..cut]);
-        let response = self
-            .model
-            .send(SUMMARY_INSTRUCTIONS, &[Message::user(transcript)], &[])?;
+        let response = self.model.send(
+            SUMMARY_INSTRUCTIONS,
+            &[Message::user(transcript)],
+            &[],
+            &mut std::io::sink(),
+        )?;
         if response.tool_call.is_some() {
             return Err("compaction summary requested a tool".into());
         }
@@ -209,9 +215,10 @@ impl Model {
         system: &str,
         history: &[Message],
         definitions: &[ToolDefinition],
+        output: &mut impl Write,
     ) -> Result<AssistantResponse, String> {
         match self {
-            Self::Live(client) => client.send(system, history, definitions),
+            Self::Live(client) => client.send(system, history, definitions, output),
             Self::Script(script) => {
                 // Preserve the live request-size boundary in the offline driver.
                 crate::anthropic::encode_request(system, history, definitions)?;
@@ -220,7 +227,17 @@ impl Model {
                     .ok_or("offline script has no remaining responses")?;
                 let body =
                     serde_json::to_vec(&value).map_err(|_| "could not encode offline response")?;
-                crate::anthropic::decode_response(&body)
+                let response = crate::anthropic::decode_response(&body)?;
+                let mut write = || -> IoResult<()> {
+                    for block in &response.content {
+                        if let ContentBlock::Text { text } = block {
+                            output.write_all(text.as_bytes())?;
+                        }
+                    }
+                    output.flush()
+                };
+                write().map_err(|_| "could not write response to stdout")?;
+                Ok(response)
             }
         }
     }
@@ -229,22 +246,23 @@ impl Model {
 fn check_call_budget(response: &AssistantResponse, calls: usize) -> Result<(), String> {
     if response.tool_call.is_some() && calls >= MAX_MODEL_CALLS_PER_TURN {
         return Err(
-            "model-call budget exhausted (8 calls per user turn); tool not executed".into(),
+            "model-call budget exhausted (8 calls per user turn); tool not executed, response discarded"
+                .into(),
         );
     }
     Ok(())
 }
 
-fn write_assistant(output: &mut impl Write, response: &AssistantResponse) -> Result<(), String> {
+fn finish_assistant_output(
+    output: &mut impl Write,
+    response: &AssistantResponse,
+) -> Result<(), String> {
     let mut write = || -> IoResult<()> {
-        let mut has_text = false;
-        for block in &response.content {
-            if let ContentBlock::Text { text } = block {
-                write!(output, "{text}")?;
-                has_text = true;
-            }
-        }
-        if has_text {
+        if response
+            .content
+            .iter()
+            .any(|block| matches!(block, ContentBlock::Text { .. }))
+        {
             writeln!(output)?;
         }
         output.flush()

@@ -1,7 +1,10 @@
 use crate::tools::ToolDefinition;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, from_slice, to_vec};
-use std::time::Duration;
+use std::{
+    io::{BufRead, BufReader, ErrorKind, Write},
+    time::Duration,
+};
 use ureq::{
     Agent as HttpAgent, Error as HttpError,
     http::{HeaderValue, Request},
@@ -12,6 +15,8 @@ pub const MODEL: &str = "claude-haiku-4-5-20251001";
 const MAX_TOKENS: u32 = 512;
 const MAX_RESPONSE_BYTES: u64 = 1024 * 1024;
 const MAX_REQUEST_BYTES: usize = 1024 * 1024;
+const OUTPUT_LIMIT_ERROR: &str =
+    "response reached the 512-token output limit; partial response discarded";
 
 #[derive(Debug, Serialize)]
 struct MessageRequest<'a> {
@@ -68,7 +73,7 @@ impl Message {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 struct MessageResponse {
     #[serde(rename = "type")]
     kind: String,
@@ -139,17 +144,12 @@ impl Client {
         system: &str,
         messages: &[Message],
         tools: &[ToolDefinition],
+        output: &mut impl Write,
     ) -> Result<AssistantResponse, String> {
         let request = build_request(system, messages, tools, &self.key)?;
         let mut response = self.agent.run(request).map_err(transport_error)?;
         check_status(response.status().as_u16())?;
-        let body = response
-            .body_mut()
-            .with_config()
-            .limit(MAX_RESPONSE_BYTES)
-            .read_to_vec()
-            .map_err(transport_error)?;
-        decode_response(&body)
+        read_body(response.body_mut(), output)
     }
 }
 
@@ -186,7 +186,7 @@ pub(crate) fn encode_request(
     let body = to_vec(&MessageRequest {
         model: MODEL,
         max_tokens: MAX_TOKENS,
-        stream: false,
+        stream: true,
         system,
         messages,
         tools,
@@ -221,16 +221,163 @@ fn check_status(status: u16) -> Result<(), String> {
 pub(crate) fn decode_response(body: &[u8]) -> Result<AssistantResponse, String> {
     let response: MessageResponse = from_slice(body)
         .map_err(|_| "Anthropic returned invalid JSON or an unexpected message schema")?;
+    finish(response)
+}
+
+fn read_body(body: &mut ureq::Body, output: &mut impl Write) -> Result<AssistantResponse, String> {
+    let reader = body.with_config().limit(MAX_RESPONSE_BYTES).reader();
+    read_stream(BufReader::new(reader), output)
+}
+
+pub(crate) fn read_stream(
+    reader: impl BufRead,
+    output: &mut impl Write,
+) -> Result<AssistantResponse, String> {
+    let mut wrote_text = false;
+    let read = || {
+        let mut response = MessageResponse::default();
+        let mut block_open = false;
+        let mut tool_input = String::new();
+        let mut saw_message_stop = false;
+
+        for line in reader.lines() {
+            let line = line.map_err(|error| match error.kind() {
+                ErrorKind::InvalidData => "Anthropic stream contains invalid UTF-8".into(),
+                _ => transport_error(error.into()),
+            })?;
+            if line.is_empty() || line.starts_with("event:") || line.starts_with(':') {
+                continue;
+            }
+            // Anthropic puts each JSON object on one data line. Multi-line SSE data is unsupported.
+            let data = line
+                .strip_prefix("data:")
+                .ok_or("unexpected Anthropic stream line")?;
+            let event: Value =
+                serde_json::from_str(data).map_err(|_| "invalid JSON in Anthropic stream")?;
+            let field = |path| {
+                event
+                    .pointer(path)
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| format!("missing or invalid Anthropic stream field {path}"))
+            };
+            let kind = field("/type")?;
+            let index = event["index"].as_u64();
+            let mut text_to_write = "";
+            match kind {
+                "message_start" => {
+                    let message = &event["message"];
+                    if message["type"] != "message" || message["role"] != "assistant" {
+                        return Err("expected an Anthropic assistant message".into());
+                    }
+                    if !response.kind.is_empty() {
+                        return Err("duplicate Anthropic message_start".into());
+                    }
+                    response.kind = "message".into();
+                    response.role = "assistant".into();
+                }
+                "content_block_start" => {
+                    if response.kind.is_empty()
+                        || block_open
+                        || index != Some(response.content.len() as u64)
+                    {
+                        return Err("unexpected Anthropic content block start".into());
+                    }
+                    let content = match field("/content_block/type")? {
+                        "text" => {
+                            text_to_write = field("/content_block/text")?;
+                            ContentBlock::Text {
+                                text: text_to_write.into(),
+                            }
+                        }
+                        "tool_use" => ContentBlock::ToolUse {
+                            id: field("/content_block/id")?.into(),
+                            name: field("/content_block/name")?.into(),
+                            input: Value::Null,
+                        },
+                        _ => ContentBlock::Unsupported,
+                    };
+                    response.content.push(content);
+                    block_open = true;
+                }
+                "content_block_delta" | "content_block_stop" => {
+                    if !block_open || index != Some(response.content.len() as u64 - 1) {
+                        return Err("unexpected Anthropic content block index".into());
+                    }
+                    let block = response.content.last_mut().expect("open block");
+                    match (kind, block, event["delta"]["type"].as_str()) {
+                        ("content_block_stop", ContentBlock::ToolUse { input, .. }, _) => {
+                            *input = serde_json::from_str(if tool_input.is_empty() {
+                                "{}"
+                            } else {
+                                &tool_input
+                            })
+                            .map_err(|_| "invalid tool input JSON in Anthropic stream")?;
+                            tool_input.clear();
+                            block_open = false;
+                        }
+                        ("content_block_stop", _, _) => block_open = false,
+                        (_, ContentBlock::Text { text }, Some("text_delta")) => {
+                            text_to_write = field("/delta/text")?;
+                            text.push_str(text_to_write);
+                        }
+                        (_, ContentBlock::ToolUse { .. }, Some("input_json_delta")) => {
+                            tool_input.push_str(field("/delta/partial_json")?);
+                        }
+                        (_, ContentBlock::Unsupported, _) => {}
+                        _ => return Err("unexpected Anthropic content block delta".into()),
+                    }
+                }
+                "message_delta" => match event["delta"].get("stop_reason") {
+                    Some(Value::String(reason)) => response.stop_reason.clone_from(reason),
+                    Some(Value::Null) | None => {}
+                    _ => return Err("invalid Anthropic stop_reason".into()),
+                },
+                "message_stop" => {
+                    saw_message_stop = true;
+                    break;
+                }
+                "error" => {
+                    let kind = event["error"]["type"].as_str().unwrap_or("unknown");
+                    return Err(format!("Anthropic stream error: {}", kind.escape_debug()));
+                }
+                _ => {} // Includes pings and future event types.
+            }
+            if !text_to_write.is_empty() {
+                wrote_text = true;
+                output
+                    .write_all(text_to_write.as_bytes())
+                    .and_then(|()| output.flush())
+                    .map_err(|_| "could not write response to stdout")?;
+            }
+        }
+        if !saw_message_stop {
+            return Err("stream ended before message_stop".into());
+        }
+        if block_open {
+            return Err("message_stop arrived before content_block_stop".into());
+        }
+        finish(response)
+    };
+
+    read().map_err(|error| {
+        if wrote_text {
+            let _ = writeln!(output).and_then(|()| output.flush());
+        }
+        if error == OUTPUT_LIMIT_ERROR {
+            error
+        } else {
+            format!("{error}; partial response discarded")
+        }
+    })
+}
+
+fn finish(response: MessageResponse) -> Result<AssistantResponse, String> {
     if response.kind != "message" || response.role != "assistant" {
         return Err("expected an Anthropic assistant message".into());
     }
     match response.stop_reason.as_str() {
         "end_turn" | "tool_use" => {}
-        "max_tokens" => {
-            return Err(
-                "response reached the 512-token output limit; partial text withheld".into(),
-            );
-        }
+        "max_tokens" => return Err(OUTPUT_LIMIT_ERROR.into()),
         "refusal" => return Err("Anthropic refused the request".into()),
         _ => return Err("response did not finish with end_turn or tool_use".into()),
     }
@@ -327,6 +474,7 @@ mod tests {
         assert_eq!(request.uri(), ENDPOINT);
         assert!(request.headers()["x-api-key"].is_sensitive());
         let wire: Value = from_slice(request.body()).unwrap();
+        assert_eq!(wire["stream"], true);
         assert_eq!(wire["system"], "synthetic system");
         assert_eq!(
             wire["messages"],
@@ -355,7 +503,7 @@ mod tests {
         assert!(
             decode_response(&to_vec(&body).unwrap())
                 .unwrap_err()
-                .contains("partial text withheld")
+                .contains("partial response discarded")
         );
     }
 
@@ -377,5 +525,152 @@ mod tests {
         assert!(check_status(200).is_ok());
         assert!(check_status(401).unwrap_err().contains("authentication"));
         assert!(validate_key("").is_err());
+    }
+
+    // Encode a synthetic event stream.
+    fn sse(events: &[Value]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        for event in events {
+            let kind = event["type"].as_str().unwrap();
+            write!(bytes, "event: {kind}\ndata: {event}\n\n").unwrap();
+        }
+        bytes
+    }
+
+    #[test]
+    fn stream_matches_decoder() {
+        let bytes = sse(&[
+            json!({"type":"message_start","message":{"type":"message","role":"assistant"}}),
+            json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}),
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hel"}}),
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"lo "}}),
+            json!({"type":"content_block_stop","index":0}),
+            json!({"type":"ping"}),
+            json!({"type":"synthetic_future_event"}),
+            json!({"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}),
+            json!({"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"世界!"}}),
+            json!({"type":"content_block_stop","index":1}),
+            json!({"type":"message_delta","delta":{"stop_reason":"end_turn"}}),
+            json!({"type":"message_stop"}),
+        ]);
+        let mut output = Vec::new();
+        let streamed = read_stream(&bytes[..], &mut output).unwrap();
+        let decoded = decode_response(&to_vec(&response()).unwrap()).unwrap();
+        assert_eq!(
+            to_value(&streamed.content).unwrap(),
+            to_value(&decoded.content).unwrap()
+        );
+        assert_eq!(streamed.tool_call, decoded.tool_call);
+        assert_eq!(output, "Hello 世界!".as_bytes());
+    }
+
+    #[test]
+    fn tool_input_is_assembled() {
+        let start = [
+            json!({"type":"message_start","message":{"type":"message","role":"assistant"}}),
+            json!({"type":"content_block_start","index":0,"content_block":{
+                "type":"tool_use","id":"toolu_synthetic","name":"read_file","input":{}
+            }}),
+        ];
+        let deltas = [
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"pa"}}),
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"th\":\"a"}}),
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":".txt\"}"}}),
+        ];
+        let end = [
+            json!({"type":"content_block_stop","index":0}),
+            json!({"type":"message_delta","delta":{"stop_reason":"tool_use"}}),
+            json!({"type":"message_stop"}),
+        ];
+        for (deltas, expected) in [(&deltas[..], json!({"path":"a.txt"})), (&[][..], json!({}))] {
+            let bytes = sse(&[&start[..], deltas, &end[..]].concat());
+            let mut output = Vec::new();
+            let streamed = read_stream(&bytes[..], &mut output).unwrap();
+            assert_eq!(streamed.tool_call.unwrap().input, expected);
+            assert!(output.is_empty());
+        }
+    }
+
+    #[test]
+    fn error_event_after_text() {
+        let bytes = sse(&[
+            json!({"type":"message_start","message":{"type":"message","role":"assistant"}}),
+            json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}),
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"partial"}}),
+            json!({"type":"error","error":{"type":"overloaded_error"}}),
+        ]);
+        let mut output = Vec::new();
+        let error = read_stream(&bytes[..], &mut output).unwrap_err();
+        assert!(error.contains("overloaded_error"));
+        assert!(error.contains("partial response discarded"));
+        assert_eq!(output, b"partial\n");
+    }
+
+    #[test]
+    fn eof_before_message_stop() {
+        let bytes = sse(&[
+            json!({"type":"message_start","message":{"type":"message","role":"assistant"}}),
+            json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}),
+        ]);
+        let mut output = Vec::new();
+        let error = read_stream(&bytes[..], &mut output).unwrap_err();
+        assert!(error.contains("message_stop"));
+        assert!(output.is_empty());
+    }
+
+    #[test]
+    fn max_tokens_discards() {
+        let bytes = sse(&[
+            json!({"type":"message_start","message":{"type":"message","role":"assistant"}}),
+            json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}),
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"partial"}}),
+            json!({"type":"content_block_stop","index":0}),
+            json!({"type":"message_delta","delta":{"stop_reason":"max_tokens"}}),
+            json!({"type":"message_stop"}),
+        ]);
+        let mut output = Vec::new();
+        let error = read_stream(&bytes[..], &mut output).unwrap_err();
+        assert_eq!(error, OUTPUT_LIMIT_ERROR);
+        assert_eq!(output, b"partial\n");
+    }
+
+    #[test]
+    fn invalid_tool_json_and_wrong_index() {
+        let start = [
+            json!({"type":"message_start","message":{"type":"message","role":"assistant"}}),
+            json!({"type":"content_block_start","index":0,"content_block":{
+                "type":"tool_use","id":"toolu_synthetic","name":"read_file","input":{}
+            }}),
+        ];
+        let invalid_json = [
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"path\":"}}),
+            json!({"type":"content_block_stop","index":0}),
+        ];
+        let wrong_index = [
+            json!({"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{}"}}),
+        ];
+        for (tail, expected) in [
+            (&invalid_json[..], "invalid tool input JSON"),
+            (&wrong_index[..], "unexpected Anthropic content block index"),
+        ] {
+            let bytes = sse(&[&start[..], tail].concat());
+            let mut output = Vec::new();
+            let error = read_stream(&bytes[..], &mut output).unwrap_err();
+            assert!(error.contains(expected), "{error}");
+            assert!(output.is_empty());
+        }
+    }
+
+    #[test]
+    fn body_limit_is_enforced() {
+        let mut bytes =
+            sse(&[json!({"type":"message_start","message":{"type":"message","role":"assistant"}})]);
+        let comment = b": ping\n";
+        bytes.extend(comment.repeat(MAX_RESPONSE_BYTES as usize / comment.len() + 1));
+        let mut body = ureq::Body::builder().data(bytes);
+        let mut output = Vec::new();
+        let error = read_body(&mut body, &mut output).unwrap_err();
+        assert!(error.contains("1 MiB"), "{error}");
+        assert!(output.is_empty());
     }
 }

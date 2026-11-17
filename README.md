@@ -70,6 +70,16 @@ The [offline demonstration](#offline-demonstration) runs without credentials.
 
 The rest of this document is reference for current behavior and limits.
 
+## Streaming
+
+Live runs display assistant text as it arrives. The agent adds the assistant
+message to history and can execute its tool only after a complete, validated
+response. The checkpoint is saved when the turn finishes.
+If a response fails after displaying partial text, the program stops, discards
+that response, and keeps the previous checkpoint. The displayed text stays on
+screen. Offline runs use complete response objects, so only the synthetic unit
+tests exercise the stream parser offline.
+
 ## Workspace tools and permissions
 
 `--workspace PATH` selects an existing, narrow project directory. Access is read-only
@@ -263,7 +273,7 @@ Command exit failure is represented by its exit code/signal. Protocol, transport
 budget, and output failures stop the program. Invalid
 or truncated responses never execute tools; a tool request on call eight fails
 before execution. Every turn gets a fresh budget, including after resume.
-Full history accompanies every request, without streaming or retries, until
+Full history accompanies every request, with no retries, until
 [context compaction](#context-compaction) replaces older turns with a summary.
 
 ```sh
