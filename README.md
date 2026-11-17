@@ -26,6 +26,7 @@ be needed, and answers one question. Read the commits in order to follow along.
 [c11]: https://github.com/udayj/hermes-kernel-lab/commit/f2000b0
 [c12]: https://github.com/udayj/hermes-kernel-lab/commit/265ea4b
 [c13]: https://github.com/udayj/hermes-kernel-lab/commit/04435f2
+[c14]: https://github.com/udayj/hermes-kernel-lab/commit/27d402b
 
 | # | Step | Kind | Question it answers |
 | --- | --- | --- | --- |
@@ -42,6 +43,7 @@ be needed, and answers one question. Read the commits in order to follow along.
 | 11 | [Write tools and sandboxed shell][c11] | build | What does it take to let the model change things safely? |
 | 12 | [Threat model and cut][c12] | prune | Who is untrusted? Answering that removed a third of the code. |
 | 13 | [Context compaction][c13] | build | How can an agent keep going when conversation history grows too large? |
+| 14 | [Streaming][c14] | build | When does model output become real? |
 
 The whole turn loop is `Agent::run_turn` in [`src/agent.rs`](src/agent.rs).
 
